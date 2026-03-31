@@ -4,6 +4,10 @@ YOLOv11 object detection implemented in Rust using the [Candle](https://github.c
 
 Based on the PyTorch re-implementation in [YOLOv11-pt](https://github.com/jahongir7174/YOLOv11-pt).
 
+## License
+
+License derives from PyTorch reimplementation. It is likely AGPL 3.0
+
 ## Requirements
 
 - Rust 1.70+
