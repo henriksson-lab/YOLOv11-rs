@@ -1,5 +1,5 @@
 use anyhow::Result;
-use candle_core::Device;
+use burn::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Instant;
 
@@ -10,17 +10,16 @@ use crate::model::nms;
 
 /// Run evaluation on the validation set.
 /// Returns (mAP, mAP50, recall, precision).
-pub fn test(
-    model: &YOLO,
+pub fn test<B: Backend>(
+    model: &YOLO<B>,
     dataset: &Dataset,
     num_classes: usize,
-    device: &Device,
+    device: &B::Device,
     batch_size: usize,
 ) -> Result<(f32, f32, f32, f32)> {
     let n = dataset.len();
     let num_batches = (n + batch_size - 1) / batch_size;
 
-    // IoU thresholds: 0.5 to 0.95 in steps of 0.05
     let iou_thresholds: Vec<f32> = (0..10).map(|i| 0.5 + i as f32 * 0.05).collect();
 
     let pb = ProgressBar::new(num_batches as u64);
@@ -44,41 +43,46 @@ pub fn test(
         let end = (start + batch_size).min(n);
 
         let t0 = Instant::now();
-        let mut samples: Vec<Sample> = Vec::new();
+        let mut samples: Vec<Sample<B>> = Vec::new();
         for i in start..end {
             samples.push(dataset.get(i, device)?);
         }
 
-        let batch = dataset::collate(&samples, device)?;
-        let images = batch.images; // [B, 3, H, W] already in 0..1
+        let batch = dataset::collate(&samples, device);
+        let images = batch.images;
         total_data_time += t0.elapsed();
 
         // Forward (inference)
         let t1 = Instant::now();
-        let output = model.forward_infer(&images)?; // [B, 4+nc, A]
+        let output = model.forward_infer(images); // [B, 4+nc, A]
         total_forward_time += t1.elapsed();
 
         // NMS
         let t2 = Instant::now();
-        let detections = nms::batch_nms(&output, 0.001, 0.65, 300)?;
+        let detections = nms::batch_nms(&output, 0.001, 0.65, 300);
         total_nms_time += t2.elapsed();
 
         // Match against GT
         let t3 = Instant::now();
-        let gt_cls: Vec<f32> = batch.cls.squeeze(1)?.to_vec1()?;
-        let gt_bbox: Vec<Vec<f32>> = (0..batch.bbox.dims()[0])
-            .map(|i| batch.bbox.get(i).unwrap().to_vec1::<f32>().unwrap())
+        let gt_cls: Vec<f32> = batch.cls.clone().squeeze::<1>(1).to_data().to_vec().unwrap();
+        let gt_bbox_data: Vec<f32> = batch.bbox.to_data().to_vec().unwrap();
+        let num_gt = gt_cls.len();
+        let gt_bbox: Vec<[f32; 4]> = (0..num_gt)
+            .map(|i| [
+                gt_bbox_data[i * 4],
+                gt_bbox_data[i * 4 + 1],
+                gt_bbox_data[i * 4 + 2],
+                gt_bbox_data[i * 4 + 3],
+            ])
             .collect();
-        let gt_idx: Vec<f32> = batch.idx.to_vec1()?;
+        let gt_idx: Vec<f32> = batch.idx.to_data().to_vec().unwrap();
 
-        let input_size = images.dims()[3] as f32;
+        let input_size = samples[0].image.dims()[2] as f32; // H dimension
 
         for b in 0..samples.len() {
-            // Get GT for this image
             let mut gt_boxes: Vec<[f32; 5]> = Vec::new();
             for t in 0..gt_idx.len() {
                 if gt_idx[t] as usize == b {
-                    // Convert normalized xywh to pixel xyxy
                     let cx = gt_bbox[t][0] * input_size;
                     let cy = gt_bbox[t][1] * input_size;
                     let w = gt_bbox[t][2] * input_size;
@@ -93,7 +97,6 @@ pub fn test(
                 }
             }
 
-            // Convert detections to metric format
             let pred_boxes: Vec<[f32; 6]> = detections[b]
                 .iter()
                 .map(|d| [d.x1, d.y1, d.x2, d.y2, d.confidence, d.class as f32])
@@ -128,3 +131,4 @@ pub fn test(
 
     Ok((mean_ap, map50, recall, precision))
 }
+

@@ -1,61 +1,66 @@
-use candle_core::{Result, Tensor};
-use candle_nn::VarBuilder;
+use burn::module::Module;
+use burn::prelude::*;
+use burn::tensor::module::interpolate;
+use burn::tensor::ops::InterpolateOptions;
 
 use crate::model::blocks::CSP;
-use crate::model::conv::{Activation, Conv};
+use crate::model::conv::ConvBn;
 
 /// DarkFPN neck – fuses multi-scale features from backbone.
-pub struct DarkFPN {
-    h1: CSP,
-    h2: CSP,
-    h3: Conv,
-    h4: CSP,
-    h5: Conv,
-    h6: CSP,
+#[derive(Module, Debug)]
+pub struct DarkFPN<B: Backend> {
+    h1: CSP<B>,
+    h2: CSP<B>,
+    h3: ConvBn<B>,
+    h4: CSP<B>,
+    h5: ConvBn<B>,
+    h6: CSP<B>,
 }
 
-impl DarkFPN {
-    pub fn new(width: &[usize], depth: &[usize], csp: &[bool], vb: VarBuilder) -> Result<Self> {
-        let h1 = CSP::new(width[4] + width[5], width[4], depth[5], csp[0], 2, vb.pp("h1"))?;
-        let h2 = CSP::new(width[4] + width[4], width[3], depth[5], csp[0], 2, vb.pp("h2"))?;
-        let h3 = Conv::new(width[3], width[3], Activation::SiLU, 3, 2, 1, 1, vb.pp("h3"))?;
-        let h4 = CSP::new(width[3] + width[4], width[4], depth[5], csp[0], 2, vb.pp("h4"))?;
-        let h5 = Conv::new(width[4], width[4], Activation::SiLU, 3, 2, 1, 1, vb.pp("h5"))?;
-        let h6 = CSP::new(width[4] + width[5], width[5], depth[5], csp[1], 2, vb.pp("h6"))?;
-        Ok(Self { h1, h2, h3, h4, h5, h6 })
+impl<B: Backend> DarkFPN<B> {
+    pub fn new(width: &[usize], depth: &[usize], csp: &[bool], device: &B::Device) -> Self {
+        let h1 = CSP::new(width[4] + width[5], width[4], depth[5], csp[0], 2, device);
+        let h2 = CSP::new(width[4] + width[4], width[3], depth[5], csp[0], 2, device);
+        let h3 = ConvBn::new(width[3], width[3], 3, 2, 1, 1, device);
+        let h4 = CSP::new(width[3] + width[4], width[4], depth[5], csp[0], 2, device);
+        let h5 = ConvBn::new(width[4], width[4], 3, 2, 1, 1, device);
+        let h6 = CSP::new(width[4] + width[5], width[5], depth[5], csp[1], 2, device);
+        Self { h1, h2, h3, h4, h5, h6 }
     }
 
-    /// Takes (p3, p4, p5) and returns refined (p3, p4, p5).
     pub fn forward(
         &self,
-        p3: &Tensor,
-        p4: &Tensor,
-        p5: &Tensor,
-        training: bool,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        let (_, _, p4h, p4w) = p4.dims4()?;
-        let (_, _, p3h, p3w) = p3.dims4()?;
+        p3: Tensor<B, 4>,
+        p4: Tensor<B, 4>,
+        p5: Tensor<B, 4>,
+    ) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {
+        let [_, _, p4h, p4w] = p4.dims();
+        let [_, _, p3h, p3w] = p3.dims();
 
-        // Upsample p5 -> p4 size, concat, CSP
-        let up5 = p5.upsample_nearest2d(p4h, p4w)?;
-        let p4 = Tensor::cat(&[&up5, p4], 1)?;
-        let p4 = self.h1.forward(&p4, training)?;
+        let up5 = interpolate(
+            p5.clone(),
+            [p4h, p4w],
+            InterpolateOptions::new(burn::tensor::ops::InterpolateMode::Nearest),
+        );
+        let p4_out = Tensor::cat(vec![up5, p4], 1);
+        let p4_out = self.h1.forward(p4_out);
 
-        // Upsample p4 -> p3 size, concat, CSP
-        let up4 = p4.upsample_nearest2d(p3h, p3w)?;
-        let p3 = Tensor::cat(&[&up4, p3], 1)?;
-        let p3 = self.h2.forward(&p3, training)?;
+        let up4 = interpolate(
+            p4_out.clone(),
+            [p3h, p3w],
+            InterpolateOptions::new(burn::tensor::ops::InterpolateMode::Nearest),
+        );
+        let p3_out = Tensor::cat(vec![up4, p3], 1);
+        let p3_out = self.h2.forward(p3_out);
 
-        // Downsample p3 -> concat with p4, CSP
-        let down3 = self.h3.forward(&p3, training)?;
-        let p4 = Tensor::cat(&[&down3, &p4], 1)?;
-        let p4 = self.h4.forward(&p4, training)?;
+        let down3 = self.h3.forward_silu(p3_out.clone());
+        let p4_out = Tensor::cat(vec![down3, p4_out], 1);
+        let p4_out = self.h4.forward(p4_out);
 
-        // Downsample p4 -> concat with p5, CSP
-        let down4 = self.h5.forward(&p4, training)?;
-        let p5 = Tensor::cat(&[&down4, p5], 1)?;
-        let p5 = self.h6.forward(&p5, training)?;
+        let down4 = self.h5.forward_silu(p4_out.clone());
+        let p5_out = Tensor::cat(vec![down4, p5], 1);
+        let p5_out = self.h6.forward(p5_out);
 
-        Ok((p3, p4, p5))
+        (p3_out, p4_out, p5_out)
     }
 }

@@ -5,11 +5,11 @@ edition = "2021"
 
 [features]
 default = []
-cuda = ["candle-core/cuda"]
+cuda = ["burn/candle-cuda"]
 
 [dependencies]
-candle-core = "0.8"
-candle-nn = "0.8"
+burn = { version = "0.16", features = ["train", "wgpu"] }
+burn-import = { version = "0.16", features = ["pytorch"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
@@ -20,4 +20,3 @@ rayon = "1"
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 csv = "1"
-safetensors = "0.4"

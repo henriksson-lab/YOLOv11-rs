@@ -1,5 +1,7 @@
 /// Non-maximum suppression on CPU.
 
+use burn::prelude::*;
+
 #[derive(Debug, Clone)]
 pub struct Detection {
     pub x1: f32,
@@ -12,10 +14,10 @@ pub struct Detection {
 
 /// Apply NMS to model output for a single image.
 ///
-/// `preds` is shaped [4+nc, num_anchors] (cx, cy, w, h, cls_scores...).
+/// `preds` is shaped [num_anchors][4+nc] (cx, cy, w, h, cls_scores...).
 /// Returns up to `max_det` detections per image.
 pub fn non_max_suppression(
-    preds: &[Vec<f32>],  // [num_anchors][4+nc]
+    preds: &[Vec<f32>],
     conf_threshold: f32,
     iou_threshold: f32,
     max_det: usize,
@@ -26,7 +28,6 @@ pub fn non_max_suppression(
         preds[0].len() - 4
     };
 
-    // Collect candidates above confidence threshold
     let mut candidates: Vec<Detection> = Vec::new();
     for pred in preds {
         let cx = pred[0];
@@ -34,7 +35,6 @@ pub fn non_max_suppression(
         let w = pred[2];
         let h = pred[3];
 
-        // Find max class score
         let mut max_score = 0.0f32;
         let mut max_cls = 0usize;
         for c in 0..nc {
@@ -58,10 +58,8 @@ pub fn non_max_suppression(
         });
     }
 
-    // Sort by confidence descending
     candidates.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
 
-    // Greedy NMS per class
     let mut keep: Vec<Detection> = Vec::new();
     while !candidates.is_empty() && keep.len() < max_det {
         let best = candidates.remove(0);
@@ -94,22 +92,24 @@ fn iou_single(a: &Detection, b: &Detection) -> f32 {
 }
 
 /// Batch NMS: process model output tensor [B, 4+nc, A] into Vec<Vec<Detection>>.
-pub fn batch_nms(
-    output: &candle_core::Tensor,
+pub fn batch_nms<B: Backend>(
+    output: &Tensor<B, 3>,
     conf_threshold: f32,
     iou_threshold: f32,
     max_det: usize,
-) -> anyhow::Result<Vec<Vec<Detection>>> {
-    let (batch, _no, num_a) = output.dims3()?;
+) -> Vec<Vec<Detection>> {
+    let [batch, _no, num_a] = output.dims();
     let mut results = Vec::with_capacity(batch);
 
     for b in 0..batch {
-        let img_out = output.get(b)?; // [4+nc, A]
-        let img_out = img_out.transpose(0, 1)?; // [A, 4+nc]
-        let data: Vec<Vec<f32>> = (0..num_a)
-            .map(|i| img_out.get(i).unwrap().to_vec1::<f32>().unwrap())
+        let img_out = output.clone().narrow(0, b, 1).squeeze::<2>(0); // [4+nc, A]
+        let img_out = img_out.swap_dims(0, 1); // [A, 4+nc]
+        let data: Vec<f32> = img_out.to_data().to_vec().unwrap();
+        let no = _no;
+        let preds: Vec<Vec<f32>> = (0..num_a)
+            .map(|i| data[i * no..(i + 1) * no].to_vec())
             .collect();
-        results.push(non_max_suppression(&data, conf_threshold, iou_threshold, max_det));
+        results.push(non_max_suppression(&preds, conf_threshold, iou_threshold, max_det));
     }
-    Ok(results)
+    results
 }

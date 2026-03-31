@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use burn::prelude::*;
 use image::GenericImageView;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -40,10 +41,10 @@ pub struct Dataset {
 }
 
 /// A single sample returned by the dataset.
-pub struct Sample {
+pub struct Sample<B: Backend> {
     /// Image tensor [3, H, W] in 0..1 range.
-    pub image: candle_core::Tensor,
-    /// Class labels [N, 1].
+    pub image: Tensor<B, 3>,
+    /// Class labels [N].
     pub cls: Vec<f32>,
     /// Bounding boxes [N, 4] in normalized (cx, cy, w, h).
     pub bbox: Vec<[f32; 4]>,
@@ -51,8 +52,6 @@ pub struct Sample {
 
 impl Dataset {
     /// Create a new dataset.
-    /// `filenames_txt` is a file listing image paths, one per line.
-    /// `data_dir` is the root COCO-format directory.
     pub fn new(
         filenames: Vec<PathBuf>,
         input_size: u32,
@@ -89,18 +88,16 @@ impl Dataset {
     }
 
     /// Get a single sample (with augmentation if enabled).
-    pub fn get(&self, index: usize, device: &candle_core::Device) -> Result<Sample> {
+    pub fn get<B: Backend>(&self, index: usize, device: &B::Device) -> Result<Sample<B>> {
         let mut rng = rand::thread_rng();
 
         if self.mosaic && rng.gen::<f32>() < self.mosaic_prob {
-            // Mosaic augmentation
             let mut indices = vec![index];
             for _ in 0..3 {
                 indices.push(rng.gen_range(0..self.len()));
             }
             let (img, labels) = self.load_mosaic(&indices)?;
 
-            // Apply perspective augmentation
             let (img, labels) = augment::random_perspective(
                 &img,
                 &labels,
@@ -113,29 +110,22 @@ impl Dataset {
             );
 
             let (img, labels) = self.apply_pixel_augments(img, labels, &mut rng);
-            let tensor = resize::image_to_tensor(&img, device)?;
+            let tensor = resize::image_to_tensor::<B>(&img, device);
             let (cls, bbox) = split_labels(&labels);
             return Ok(Sample { image: tensor, cls, bbox });
         }
 
-        // Regular loading
         let img = self.load_image(index)?;
+        let (orig_w, orig_h) = img.dimensions();
         let (img, ratio, pad) = resize::letterbox(&img, self.input_size, self.augment)?;
 
         let mut labels = self.labels[index].clone();
-        // Transform labels to pixel coords, then back to normalized
-        let (orig_w, orig_h) = (
-            img.width() as f32 / ratio.0,
-            img.height() as f32 / ratio.1,
-        );
-        // Actually, apply ratio and pad to labels
+        let (orig_w, orig_h) = (orig_w as f32, orig_h as f32);
         for l in &mut labels {
-            // Convert from normalized xywh to pixel xyxy
             let x1 = (l.cx - l.w / 2.0) * orig_w * ratio.0 + pad.0;
             let y1 = (l.cy - l.h / 2.0) * orig_h * ratio.1 + pad.1;
             let x2 = (l.cx + l.w / 2.0) * orig_w * ratio.0 + pad.0;
             let y2 = (l.cy + l.h / 2.0) * orig_h * ratio.1 + pad.1;
-            // Back to normalized xywh
             l.cx = ((x1 + x2) / 2.0) / self.input_size as f32;
             l.cy = ((y1 + y2) / 2.0) / self.input_size as f32;
             l.w = (x2 - x1) / self.input_size as f32;
@@ -144,11 +134,11 @@ impl Dataset {
 
         if self.augment {
             let (img, labels) = self.apply_pixel_augments(img, labels, &mut rng);
-            let tensor = resize::image_to_tensor(&img, device)?;
+            let tensor = resize::image_to_tensor::<B>(&img, device);
             let (cls, bbox) = split_labels(&labels);
             Ok(Sample { image: tensor, cls, bbox })
         } else {
-            let tensor = resize::image_to_tensor(&img, device)?;
+            let tensor = resize::image_to_tensor::<B>(&img, device);
             let (cls, bbox) = split_labels(&labels);
             Ok(Sample { image: tensor, cls, bbox })
         }
@@ -203,7 +193,6 @@ impl Dataset {
             let pad_w = x1a as f32 - x1b as f32;
             let pad_h = y1a as f32 - y1b as f32;
 
-            // Copy pixels
             let copy_h: u32 = (y2a - y1a).min(y2b - y1b);
             let copy_w: u32 = (x2a - x1a).min(x2b - x1b);
             for dy in 0..copy_h {
@@ -221,13 +210,11 @@ impl Dataset {
                 }
             }
 
-            // Transform labels
             for l in &self.labels[idx] {
                 let lx1 = (l.cx - l.w / 2.0) * nw as f32 + pad_w;
                 let ly1 = (l.cy - l.h / 2.0) * nh as f32 + pad_h;
                 let lx2 = (l.cx + l.w / 2.0) * nw as f32 + pad_w;
                 let ly2 = (l.cy + l.h / 2.0) * nh as f32 + pad_h;
-                // Clip to canvas
                 let lx1 = lx1.max(0.0).min(canvas_size as f32);
                 let ly1 = ly1.max(0.0).min(canvas_size as f32);
                 let lx2 = lx2.max(0.0).min(canvas_size as f32);
@@ -253,10 +240,8 @@ impl Dataset {
         mut labels: Vec<Label>,
         rng: &mut impl Rng,
     ) -> (image::RgbImage, Vec<Label>) {
-        // HSV augmentation
         augment::augment_hsv(&mut img, self.hsv_h, self.hsv_s, self.hsv_v);
 
-        // Flip up-down
         if rng.gen::<f32>() < self.flip_ud {
             image::imageops::flip_vertical_in_place(&mut img);
             for l in &mut labels {
@@ -264,7 +249,6 @@ impl Dataset {
             }
         }
 
-        // Flip left-right
         if rng.gen::<f32>() < self.flip_lr {
             image::imageops::flip_horizontal_in_place(&mut img);
             for l in &mut labels {
@@ -275,7 +259,6 @@ impl Dataset {
         (img, labels)
     }
 
-    /// Load labels from corresponding .txt files.
     fn load_labels(filenames: &[PathBuf]) -> Result<Vec<Vec<Label>>> {
         let mut all_labels = Vec::with_capacity(filenames.len());
         for path in filenames {
@@ -311,7 +294,6 @@ impl Dataset {
         Ok(all_labels)
     }
 
-    /// Load filenames from a text file listing image paths.
     pub fn load_filenames(txt_path: &Path, data_dir: &Path, split: &str) -> Result<Vec<PathBuf>> {
         let content = fs::read_to_string(txt_path)?;
         Ok(content
@@ -325,7 +307,6 @@ impl Dataset {
     }
 }
 
-/// Convert image path to label path: .../images/split/name.jpg -> .../labels/split/name.txt
 fn image_to_label_path(image_path: &Path) -> PathBuf {
     let s = image_path.to_string_lossy();
     let s = s.replace("/images/", "/labels/");
@@ -359,23 +340,26 @@ pub struct AugmentParams {
 }
 
 /// Simple batch collation.
-pub struct Batch {
+pub struct Batch<B: Backend> {
     /// [B, 3, H, W]
-    pub images: candle_core::Tensor,
-    /// Flat class labels [total_targets].
-    pub cls: candle_core::Tensor,
+    pub images: Tensor<B, 4>,
+    /// Flat class labels [total_targets, 1].
+    pub cls: Tensor<B, 2>,
     /// Flat bounding boxes [total_targets, 4].
-    pub bbox: candle_core::Tensor,
+    pub bbox: Tensor<B, 2>,
     /// Batch index per target [total_targets].
-    pub idx: candle_core::Tensor,
+    pub idx: Tensor<B, 1>,
 }
 
-pub fn collate(
-    samples: &[Sample],
-    device: &candle_core::Device,
-) -> candle_core::Result<Batch> {
-    let imgs: Vec<&candle_core::Tensor> = samples.iter().map(|s| &s.image).collect();
-    let images = candle_core::Tensor::stack(&imgs, 0)?;
+pub fn collate<B: Backend>(
+    samples: &[Sample<B>],
+    device: &B::Device,
+) -> Batch<B> {
+    let imgs: Vec<Tensor<B, 4>> = samples
+        .iter()
+        .map(|s| s.image.clone().unsqueeze_dim(0))
+        .collect();
+    let images = Tensor::cat(imgs, 0);
 
     let mut all_cls = Vec::new();
     let mut all_bbox = Vec::new();
@@ -390,9 +374,9 @@ pub fn collate(
     }
 
     let n = all_cls.len();
-    let cls = candle_core::Tensor::from_vec(all_cls, (n, 1), device)?;
-    let bbox = candle_core::Tensor::from_vec(all_bbox, (n, 4), device)?;
-    let idx = candle_core::Tensor::from_vec(all_idx, n, device)?;
+    let cls = Tensor::<B, 1>::from_floats(all_cls.as_slice(), device).reshape([n, 1]);
+    let bbox = Tensor::<B, 1>::from_floats(all_bbox.as_slice(), device).reshape([n, 4]);
+    let idx = Tensor::<B, 1>::from_floats(all_idx.as_slice(), device);
 
-    Ok(Batch { images, cls, bbox, idx })
+    Batch { images, cls, bbox, idx }
 }

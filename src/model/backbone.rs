@@ -1,77 +1,58 @@
-use candle_core::{Result, Tensor};
-use candle_nn::VarBuilder;
+use burn::module::Module;
+use burn::prelude::*;
 
 use crate::model::attention::PSA;
 use crate::model::blocks::{CSP, SPP};
-use crate::model::conv::{Activation, Conv};
+use crate::model::conv::ConvBn;
 
 /// DarkNet backbone. Outputs feature maps at 3 scales: p3 (8x), p4 (16x), p5 (32x).
-pub struct DarkNet {
-    p1: Conv,
-    p2_conv: Conv,
-    p2_csp: CSP,
-    p3_conv: Conv,
-    p3_csp: CSP,
-    p4_conv: Conv,
-    p4_csp: CSP,
-    p5_conv: Conv,
-    p5_csp: CSP,
-    p5_spp: SPP,
-    p5_psa: PSA,
+#[derive(Module, Debug)]
+pub struct DarkNet<B: Backend> {
+    p1: ConvBn<B>,
+    p2_conv: ConvBn<B>,
+    p2_csp: CSP<B>,
+    p3_conv: ConvBn<B>,
+    p3_csp: CSP<B>,
+    p4_conv: ConvBn<B>,
+    p4_csp: CSP<B>,
+    p5_conv: ConvBn<B>,
+    p5_csp: CSP<B>,
+    p5_spp: SPP<B>,
+    p5_psa: PSA<B>,
 }
 
-impl DarkNet {
-    pub fn new(
-        width: &[usize],
-        depth: &[usize],
-        csp: &[bool],
-        vb: VarBuilder,
-    ) -> Result<Self> {
-        // p1/2
-        let p1 = Conv::new(width[0], width[1], Activation::SiLU, 3, 2, 1, 1, vb.pp("p1").pp("0"))?;
-        // p2/4
-        let p2_conv = Conv::new(width[1], width[2], Activation::SiLU, 3, 2, 1, 1, vb.pp("p2").pp("0"))?;
-        let p2_csp = CSP::new(width[2], width[3], depth[0], csp[0], 4, vb.pp("p2").pp("1"))?;
-        // p3/8
-        let p3_conv = Conv::new(width[3], width[3], Activation::SiLU, 3, 2, 1, 1, vb.pp("p3").pp("0"))?;
-        let p3_csp = CSP::new(width[3], width[4], depth[1], csp[0], 4, vb.pp("p3").pp("1"))?;
-        // p4/16
-        let p4_conv = Conv::new(width[4], width[4], Activation::SiLU, 3, 2, 1, 1, vb.pp("p4").pp("0"))?;
-        let p4_csp = CSP::new(width[4], width[4], depth[2], csp[1], 2, vb.pp("p4").pp("1"))?;
-        // p5/32
-        let p5_conv = Conv::new(width[4], width[5], Activation::SiLU, 3, 2, 1, 1, vb.pp("p5").pp("0"))?;
-        let p5_csp = CSP::new(width[5], width[5], depth[3], csp[1], 2, vb.pp("p5").pp("1"))?;
-        let p5_spp = SPP::new(width[5], width[5], 5, vb.pp("p5").pp("2"))?;
-        let p5_psa = PSA::new(width[5], depth[4], vb.pp("p5").pp("3"))?;
+impl<B: Backend> DarkNet<B> {
+    pub fn new(width: &[usize], depth: &[usize], csp: &[bool], device: &B::Device) -> Self {
+        let p1 = ConvBn::new(width[0], width[1], 3, 2, 1, 1, device);
+        let p2_conv = ConvBn::new(width[1], width[2], 3, 2, 1, 1, device);
+        let p2_csp = CSP::new(width[2], width[3], depth[0], csp[0], 4, device);
+        let p3_conv = ConvBn::new(width[3], width[3], 3, 2, 1, 1, device);
+        let p3_csp = CSP::new(width[3], width[4], depth[1], csp[0], 4, device);
+        let p4_conv = ConvBn::new(width[4], width[4], 3, 2, 1, 1, device);
+        let p4_csp = CSP::new(width[4], width[4], depth[2], csp[1], 2, device);
+        let p5_conv = ConvBn::new(width[4], width[5], 3, 2, 1, 1, device);
+        let p5_csp = CSP::new(width[5], width[5], depth[3], csp[1], 2, device);
+        let p5_spp = SPP::new(width[5], width[5], 5, device);
+        let p5_psa = PSA::new(width[5], depth[4], device);
 
-        Ok(Self {
-            p1,
-            p2_conv,
-            p2_csp,
-            p3_conv,
-            p3_csp,
-            p4_conv,
-            p4_csp,
-            p5_conv,
-            p5_csp,
-            p5_spp,
-            p5_psa,
-        })
+        Self {
+            p1, p2_conv, p2_csp, p3_conv, p3_csp,
+            p4_conv, p4_csp, p5_conv, p5_csp, p5_spp, p5_psa,
+        }
     }
 
-    /// Returns (p3, p4, p5) feature maps.
-    pub fn forward(&self, x: &Tensor, training: bool) -> Result<(Tensor, Tensor, Tensor)> {
-        let p1 = self.p1.forward(x, training)?;
-        let p2 = self.p2_conv.forward(&p1, training)?;
-        let p2 = self.p2_csp.forward(&p2, training)?;
-        let p3 = self.p3_conv.forward(&p2, training)?;
-        let p3 = self.p3_csp.forward(&p3, training)?;
-        let p4 = self.p4_conv.forward(&p3, training)?;
-        let p4 = self.p4_csp.forward(&p4, training)?;
-        let p5 = self.p5_conv.forward(&p4, training)?;
-        let p5 = self.p5_csp.forward(&p5, training)?;
-        let p5 = self.p5_spp.forward(&p5, training)?;
-        let p5 = self.p5_psa.forward(&p5, training)?;
-        Ok((p3, p4, p5))
+    pub fn forward(&self, x: Tensor<B, 4>) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {
+        let p1 = self.p1.forward_silu(x);
+        let p2 = self.p2_conv.forward_silu(p1);
+        let p2 = self.p2_csp.forward(p2);
+        let p3 = self.p3_conv.forward_silu(p2);
+        let p3 = self.p3_csp.forward(p3);
+        let p4 = self.p4_conv.forward_silu(p3.clone());
+        let p4 = self.p4_csp.forward(p4);
+        let p5 = self.p5_conv.forward_silu(p4.clone());
+        let p5 = self.p5_csp.forward(p5);
+        let p5 = self.p5_spp.forward(p5);
+        let p5 = self.p5_psa.forward(p5);
+        (p3, p4, p5)
     }
 }

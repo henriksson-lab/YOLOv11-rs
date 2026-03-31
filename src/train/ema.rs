@@ -1,81 +1,88 @@
-use candle_core::{Result, Tensor};
-use candle_nn::VarMap;
+use burn::module::{Module, ModuleMapper, ModuleVisitor, ParamId};
+use burn::prelude::*;
+use burn::tensor::TensorData;
+use std::collections::HashMap;
+
+/// Collects all float parameter data from a module.
+struct ParamCollector {
+    params: HashMap<u64, TensorData>,
+}
+
+impl ParamCollector {
+    fn new() -> Self {
+        Self {
+            params: HashMap::new(),
+        }
+    }
+}
+
+impl<B: Backend> ModuleVisitor<B> for ParamCollector {
+    fn visit_float<const D: usize>(&mut self, id: ParamId, tensor: &Tensor<B, D>) {
+        self.params.insert(id.val(), tensor.to_data());
+    }
+}
+
+/// Maps each float parameter by blending: decay * current + (1 - decay) * source.
+struct EmaMapper<B: Backend> {
+    source_params: HashMap<u64, TensorData>,
+    decay: f64,
+    device: B::Device,
+}
+
+impl<B: Backend> ModuleMapper<B> for EmaMapper<B> {
+    fn map_float<const D: usize>(&mut self, id: ParamId, tensor: Tensor<B, D>) -> Tensor<B, D> {
+        if let Some(source_data) = self.source_params.get(&id.val()) {
+            let source = Tensor::<B, D>::from_data(source_data.clone(), &self.device);
+            // ema = decay * ema + (1 - decay) * model
+            tensor * self.decay + source * (1.0 - self.decay)
+        } else {
+            tensor
+        }
+    }
+}
 
 /// Exponential Moving Average of model parameters.
-pub struct EMA {
-    /// Stored EMA parameter values, keyed by variable name.
-    params: Vec<(String, Tensor)>,
+pub struct EMA<B: Backend, M: Module<B>> {
+    shadow: M,
     decay: f64,
     tau: f64,
     updates: usize,
+    _marker: std::marker::PhantomData<B>,
 }
 
-impl EMA {
-    pub fn new(varmap: &VarMap, decay: f64, tau: f64) -> Result<Self> {
-        let data = varmap.data().lock().unwrap();
-        let params: Vec<(String, Tensor)> = data
-            .iter()
-            .map(|(name, var)| {
-                let t = var.as_tensor().detach().clone();
-                (name.clone(), t)
-            })
-            .collect();
-        Ok(Self {
-            params,
+impl<B: Backend, M: Module<B>> EMA<B, M> {
+    pub fn new(model: &M, decay: f64, tau: f64) -> Self {
+        let shadow = model.clone();
+        Self {
+            shadow,
             decay,
             tau,
             updates: 0,
-        })
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// Update EMA parameters from current model.
-    pub fn update(&mut self, varmap: &VarMap) -> Result<()> {
+    /// ema = d * ema + (1-d) * model, where d ramps up over time.
+    pub fn update(&mut self, model: &M, device: &B::Device) {
         self.updates += 1;
         let d = self.decay * (1.0 - (-((self.updates as f64) / self.tau)).exp());
 
-        let data = varmap.data().lock().unwrap();
-        for (name, ema_val) in &mut self.params {
-            if let Some(var) = data.get(name) {
-                let model_val = var.as_tensor();
-                // ema = d * ema + (1-d) * model
-                let new_val = ((d * &*ema_val)? + ((1.0 - d) * model_val)?)?;
-                *ema_val = new_val.detach();
-            }
-        }
-        Ok(())
+        // Collect current model parameters
+        let mut collector = ParamCollector::new();
+        model.visit(&mut collector);
+
+        // Blend shadow parameters with model parameters
+        let mut mapper = EmaMapper::<B> {
+            source_params: collector.params,
+            decay: d,
+            device: device.clone(),
+        };
+        self.shadow = self.shadow.clone().map(&mut mapper);
     }
 
-    /// Apply EMA weights to a VarMap (for evaluation).
-    pub fn apply_to(&self, varmap: &VarMap) -> Result<()> {
-        let mut data = varmap.data().lock().unwrap();
-        for (name, ema_val) in &self.params {
-            if let Some(var) = data.get_mut(name) {
-                var.set(ema_val)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Save current model weights, apply EMA, return guard to restore.
-    pub fn apply_and_save(&self, varmap: &VarMap) -> Result<Vec<(String, Tensor)>> {
-        let data = varmap.data().lock().unwrap();
-        let saved: Vec<(String, Tensor)> = data
-            .iter()
-            .map(|(name, var)| (name.clone(), var.as_tensor().detach().clone()))
-            .collect();
-        drop(data);
-        self.apply_to(varmap)?;
-        Ok(saved)
-    }
-
-    /// Restore previously saved weights.
-    pub fn restore(saved: Vec<(String, Tensor)>, varmap: &VarMap) -> Result<()> {
-        let mut data = varmap.data().lock().unwrap();
-        for (name, val) in saved {
-            if let Some(var) = data.get_mut(&name) {
-                var.set(&val)?;
-            }
-        }
-        Ok(())
+    /// Get a reference to the EMA model for evaluation.
+    pub fn model(&self) -> &M {
+        &self.shadow
     }
 }

@@ -1,38 +1,46 @@
 use anyhow::Result;
-use candle_core::{DType, Device};
-use candle_nn::{Optimizer, VarMap};
+use burn::optim::{GradientsParams, Optimizer, SgdConfig};
+use burn::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::seq::SliceRandom;
 use std::io::Write;
 
 use crate::data::dataset::{self, Dataset, Sample};
 use crate::model::loss::ComputeLoss;
+use crate::model::model::YOLO;
 
 use crate::train::config::Config;
 use crate::train::ema::EMA;
 use crate::train::eval;
 use crate::train::lr_schedule::LinearLR;
 
-pub fn train(
+pub fn train<B: Backend>(
     config: &Config,
     data_dir: &str,
     input_size: usize,
     batch_size: usize,
     epochs: usize,
-    device: &Device,
-) -> Result<()> {
+    device: &B::Device,
+) -> Result<()>
+where
+    B: burn::tensor::backend::AutodiffBackend,
+{
     let num_classes = config.num_classes();
 
     // Create model
-    let varmap = VarMap::new();
-    let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, device);
-    let model = crate::model::model::yolo_v11_n(num_classes, device, vb)?;
+    let model: YOLO<B> = crate::model::model::yolo_v11_n(num_classes, device);
 
     // Optimizer
     let world_size = 1usize;
     let accumulate = (64.0 / (batch_size * world_size) as f64).round().max(1.0) as usize;
 
-    let mut optimizer = candle_nn::SGD::new(varmap.all_vars(), config.min_lr)?;
+    let mut optimizer = SgdConfig::new()
+        .with_momentum(Some(burn::optim::momentum::MomentumConfig {
+            momentum: config.momentum,
+            dampening: 0.0,
+            nesterov: true,
+        }))
+        .init();
 
     // Dataset
     let train_filenames = dataset::Dataset::load_filenames(
@@ -71,13 +79,13 @@ pub fn train(
     );
 
     // EMA
-    let mut ema = EMA::new(&varmap, 0.9999, 2000.0)?;
+    let mut ema = EMA::new(&model, 0.9999, 2000.0);
 
     // Loss
-    let criterion = ComputeLoss::new(
+    let criterion = ComputeLoss::new::<B>(
         num_classes,
-        3, // nl = 3 detection layers
-        model.stride.clone(),
+        3,
+        &model.stride,
         config.box_gain(),
         config.cls_gain(),
         config.dfl_gain(),
@@ -89,9 +97,9 @@ pub fn train(
     writeln!(csv_file, "epoch,box,cls,dfl,Recall,Precision,mAP@50,mAP")?;
 
     let mut best_map = 0.0f32;
+    let mut model = model;
 
     for epoch in 0..epochs {
-        // Disable mosaic for last 10 epochs
         if epochs - epoch == 10 {
             train_dataset.mosaic = false;
         }
@@ -113,23 +121,20 @@ pub fn train(
         let mut avg_dfl = 0.0f64;
         let mut count = 0usize;
 
-        // Shuffle indices
         let mut indices: Vec<usize> = (0..train_dataset.len()).collect();
         indices.shuffle(&mut rand::thread_rng());
 
         for step_in_epoch in 0..num_steps {
             let global_step = step_in_epoch + num_steps * epoch;
             let (lr, _mom) = scheduler.get(global_step);
-            optimizer.set_learning_rate(lr);
 
-            // Build batch
             let start = step_in_epoch * batch_size;
             let end = (start + batch_size).min(train_dataset.len());
             if start >= train_dataset.len() {
                 break;
             }
 
-            let mut samples: Vec<Sample> = Vec::new();
+            let mut samples: Vec<Sample<B>> = Vec::new();
             for &idx in &indices[start..end] {
                 match train_dataset.get(idx, device) {
                     Ok(s) => samples.push(s),
@@ -140,11 +145,11 @@ pub fn train(
                 continue;
             }
 
-            let batch = dataset::collate(&samples, device)?;
+            let batch = dataset::collate(&samples, device);
             let images = batch.images;
 
             // Forward
-            let outputs = model.forward_train(&images)?;
+            let outputs = model.forward_train(images);
 
             // Loss
             let (loss_box, loss_cls, loss_dfl) = criterion.compute(
@@ -154,25 +159,25 @@ pub fn train(
                 &batch.idx,
                 samples.len(),
                 input_size,
-            )?;
+                device,
+            );
 
-            let total_loss = (&loss_box + &loss_cls)?.add(&loss_dfl)?;
-            let scaled_loss =
-                (total_loss * (batch_size as f64 * world_size as f64))?;
+            let total_loss = loss_box.clone() + loss_cls.clone() + loss_dfl.clone();
+            let scaled_loss = total_loss * (batch_size as f64 * world_size as f64);
 
             // Optimizer step with gradient accumulation
             if global_step % accumulate == 0 {
-                optimizer.backward_step(&scaled_loss)?;
-                ema.update(&varmap)?;
+                let grads = scaled_loss.backward();
+                let grads = GradientsParams::from_grads(grads, &model);
+                model = optimizer.step(lr, model, grads);
+                ema.update(&model, device);
             } else {
-                // Accumulate: just compute backward without stepping
-                let _grads = scaled_loss.backward()?;
+                let _grads = scaled_loss.backward();
             }
 
-            // Track averages
-            let lb: f32 = loss_box.to_scalar()?;
-            let lc: f32 = loss_cls.to_scalar()?;
-            let ld: f32 = loss_dfl.to_scalar()?;
+            let lb: f32 = loss_box.into_data().to_vec().unwrap()[0];
+            let lc: f32 = loss_cls.into_data().to_vec().unwrap()[0];
+            let ld: f32 = loss_dfl.into_data().to_vec().unwrap()[0];
             count += 1;
             avg_box += (lb as f64 - avg_box) / count as f64;
             avg_cls += (lc as f64 - avg_cls) / count as f64;
@@ -191,11 +196,10 @@ pub fn train(
         }
         pb.finish();
 
-        // Evaluate with EMA weights
-        let saved = ema.apply_and_save(&varmap)?;
+        // Evaluate with EMA model
+        let ema_model = ema.model();
         let (mean_ap, map50, recall, precision) =
-            eval::test(&model, &val_dataset, num_classes, device, 4)?;
-        EMA::restore(saved, &varmap)?;
+            eval::test(ema_model, &val_dataset, num_classes, device, 4)?;
 
         // Log
         writeln!(
@@ -215,9 +219,15 @@ pub fn train(
         // Save checkpoint
         if mean_ap > best_map {
             best_map = mean_ap;
-            varmap.save("weights/best.safetensors")?;
+            model
+                .clone()
+                .save_file("weights/best", &burn::record::DefaultFileRecorder::<burn::record::FullPrecisionSettings>::new())
+                .map_err(|e| anyhow::anyhow!("Failed to save model: {}", e))?;
         }
-        varmap.save("weights/last.safetensors")?;
+        model
+            .clone()
+            .save_file("weights/last", &burn::record::DefaultFileRecorder::<burn::record::FullPrecisionSettings>::new())
+            .map_err(|e| anyhow::anyhow!("Failed to save model: {}", e))?;
     }
 
     println!("\nTraining complete. Best mAP: {:.3}", best_map);

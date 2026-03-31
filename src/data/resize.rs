@@ -1,4 +1,5 @@
 use anyhow::Result;
+use burn::prelude::*;
 use image::{DynamicImage, GenericImageView, RgbImage, imageops::FilterType};
 
 /// Resize and letterbox an image to `input_size x input_size`.
@@ -21,7 +22,6 @@ pub fn letterbox(
     let filter = if augment { FilterType::CatmullRom } else { FilterType::Triangle };
     let resized = img.resize_exact(new_w, new_h, filter);
 
-    // Create output with zero-padding (gray/black border)
     let mut output = RgbImage::new(input_size, input_size);
     let left = pad_w.round() as i64;
     let top = pad_h.round() as i64;
@@ -41,10 +41,10 @@ pub fn letterbox(
 }
 
 /// Convert an RgbImage (HWC, u8) to a float tensor [C, H, W] in 0..1 range (RGB order).
-pub fn image_to_tensor(
+pub fn image_to_tensor<B: Backend>(
     img: &RgbImage,
-    device: &candle_core::Device,
-) -> candle_core::Result<candle_core::Tensor> {
+    device: &B::Device,
+) -> Tensor<B, 3> {
     let (w, h) = img.dimensions();
     let raw = img.as_raw(); // [H*W*3] in RGB order
 
@@ -60,5 +60,5 @@ pub fn image_to_tensor(
         }
     }
 
-    candle_core::Tensor::from_vec(chw, (3, h as usize, w as usize), device)
+    Tensor::<B, 1>::from_floats(chw.as_slice(), device).reshape([3, h as usize, w as usize])
 }

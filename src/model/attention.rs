@@ -1,71 +1,56 @@
-use candle_core::{Result, Tensor};
-use candle_nn::VarBuilder;
+use burn::module::Module;
+use burn::prelude::*;
+use burn::tensor::activation::softmax;
 
-use crate::model::conv::{Activation, Conv};
+use crate::model::conv::ConvBn;
 
 // ---------------------------------------------------------------------------
 // Attention (multi-head with QKV projection)
 // ---------------------------------------------------------------------------
 
-pub struct Attention {
-    num_head: usize,
-    dim_head: usize,
-    dim_key: usize,
-    scale: f64,
-    qkv: Conv,
-    conv1: Conv, // depthwise conv path
-    conv2: Conv, // output projection
+#[derive(Module, Debug)]
+pub struct Attention<B: Backend> {
+    qkv: ConvBn<B>,
+    conv1: ConvBn<B>,
+    conv2: ConvBn<B>,
 }
 
-impl Attention {
-    pub fn new(ch: usize, num_head: usize, vb: VarBuilder) -> Result<Self> {
+impl<B: Backend> Attention<B> {
+    pub fn new(ch: usize, num_head: usize, device: &B::Device) -> Self {
         let dim_head = ch / num_head;
+        let dim_key = dim_head / 2;
+        let qkv_ch = ch + dim_key * num_head * 2;
+        let qkv = ConvBn::new(ch, qkv_ch, 1, 1, 0, 1, device);
+        let conv1 = ConvBn::new(ch, ch, 3, 1, 1, ch, device);
+        let conv2 = ConvBn::new(ch, ch, 1, 1, 0, 1, device);
+        Self { qkv, conv1, conv2 }
+    }
+
+    pub fn forward(&self, x: Tensor<B, 4>, num_head: usize) -> Tensor<B, 4> {
+        let [b, c, h, w] = x.dims();
+        let dim_head = c / num_head;
         let dim_key = dim_head / 2;
         let scale = (dim_key as f64).powf(-0.5);
 
-        let qkv_ch = ch + dim_key * num_head * 2;
-        let qkv = Conv::new(ch, qkv_ch, Activation::Identity, 1, 1, 0, 1, vb.pp("qkv"))?;
-        let conv1 = Conv::new(ch, ch, Activation::Identity, 3, 1, 1, ch, vb.pp("conv1"))?;
-        let conv2 = Conv::new(ch, ch, Activation::Identity, 1, 1, 0, 1, vb.pp("conv2"))?;
+        let qkv = self.qkv.forward(x.clone()); // no activation (identity)
+        let qkv = qkv.reshape([b, num_head, dim_key * 2 + dim_head, h * w]);
 
-        Ok(Self {
-            num_head,
-            dim_head,
-            dim_key,
-            scale,
-            qkv,
-            conv1,
-            conv2,
-        })
-    }
+        let q = qkv.clone().narrow(2, 0, dim_key);
+        let k = qkv.clone().narrow(2, dim_key, dim_key);
+        let v = qkv.narrow(2, dim_key * 2, dim_head);
 
-    pub fn forward(&self, x: &Tensor, training: bool) -> Result<Tensor> {
-        let (b, c, h, w) = x.dims4()?;
+        let attn = q.swap_dims(2, 3).matmul(k);
+        let attn = attn * scale;
+        let attn = softmax(attn, 3);
 
-        let qkv = self.qkv.forward(x, training)?;
-        // Reshape to [B, num_head, dim_key*2 + dim_head, H*W]
-        let qkv = qkv.reshape((b, self.num_head, self.dim_key * 2 + self.dim_head, h * w))?;
+        let out = v.clone().matmul(attn.swap_dims(2, 3));
+        let out = out.reshape([b, c, h, w]);
 
-        // Split into Q [B,nh,dk,HW], K [B,nh,dk,HW], V [B,nh,dh,HW]
-        let q = qkv.narrow(2, 0, self.dim_key)?;
-        let k = qkv.narrow(2, self.dim_key, self.dim_key)?;
-        let v = qkv.narrow(2, self.dim_key * 2, self.dim_head)?;
+        let v_spatial = v.reshape([b, c, h, w]);
+        let conv_path = self.conv1.forward(v_spatial); // identity
+        let out = out + conv_path;
 
-        // Attention: (Q^T @ K) * scale -> softmax
-        let attn = q.transpose(2, 3)?.matmul(&k)?; // [B,nh,HW,HW]
-        let attn = (attn * self.scale)?;
-        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
-
-        // V @ attn^T  -> [B,nh,dh,HW]
-        let out = v.matmul(&attn.transpose(2, 3)?)?;
-        let out = out.reshape((b, c, h, w))?;
-
-        // Add depthwise conv path on V
-        let v_spatial = v.reshape((b, c, h, w))?;
-        let conv_path = self.conv1.forward(&v_spatial, training)?;
-        let out = out.add(&conv_path)?;
-
-        self.conv2.forward(&out, training)
+        self.conv2.forward(out) // identity
     }
 }
 
@@ -73,26 +58,27 @@ impl Attention {
 // PSABlock  (Attention + FFN with residuals)
 // ---------------------------------------------------------------------------
 
-pub struct PSABlock {
-    attn: Attention,
-    ffn1: Conv,
-    ffn2: Conv,
+#[derive(Module, Debug)]
+pub struct PSABlock<B: Backend> {
+    attn: Attention<B>,
+    ffn1: ConvBn<B>,
+    ffn2: ConvBn<B>,
 }
 
-impl PSABlock {
-    pub fn new(ch: usize, num_head: usize, vb: VarBuilder) -> Result<Self> {
-        let attn = Attention::new(ch, num_head, vb.pp("conv1"))?;
-        let ffn_vb = vb.pp("conv2");
-        let ffn1 = Conv::new(ch, ch * 2, Activation::SiLU, 1, 1, 0, 1, ffn_vb.pp("0"))?;
-        let ffn2 = Conv::new(ch * 2, ch, Activation::Identity, 1, 1, 0, 1, ffn_vb.pp("1"))?;
-        Ok(Self { attn, ffn1, ffn2 })
+impl<B: Backend> PSABlock<B> {
+    pub fn new(ch: usize, num_head: usize, device: &B::Device) -> Self {
+        let attn = Attention::new(ch, num_head, device);
+        let ffn1 = ConvBn::new(ch, ch * 2, 1, 1, 0, 1, device);
+        let ffn2 = ConvBn::new(ch * 2, ch, 1, 1, 0, 1, device);
+        Self { attn, ffn1, ffn2 }
     }
 
-    pub fn forward(&self, x: &Tensor, training: bool) -> Result<Tensor> {
-        let x = x.add(&self.attn.forward(x, training)?)?;
-        let ffn = self.ffn1.forward(&x, training)?;
-        let ffn = self.ffn2.forward(&ffn, training)?;
-        x.add(&ffn)
+    pub fn forward(&self, x: Tensor<B, 4>, num_head: usize) -> Tensor<B, 4> {
+        let attn_out = self.attn.forward(x.clone(), num_head);
+        let x = x + attn_out;
+        let ffn = self.ffn1.forward_silu(x.clone());
+        let ffn = self.ffn2.forward(ffn); // identity
+        x + ffn
     }
 }
 
@@ -100,36 +86,37 @@ impl PSABlock {
 // PSA  (Partial Self-Attention)
 // ---------------------------------------------------------------------------
 
-pub struct PSA {
-    conv1: Conv,
-    conv2: Conv,
-    res_m: Vec<PSABlock>,
+#[derive(Module, Debug)]
+pub struct PSA<B: Backend> {
+    conv1: ConvBn<B>,
+    conv2: ConvBn<B>,
+    res_m: Vec<PSABlock<B>>,
 }
 
-impl PSA {
-    pub fn new(ch: usize, n: usize, vb: VarBuilder) -> Result<Self> {
+impl<B: Backend> PSA<B> {
+    pub fn new(ch: usize, n: usize, device: &B::Device) -> Self {
         let half = ch / 2;
-        let conv1 = Conv::new(ch, 2 * half, Activation::SiLU, 1, 1, 0, 1, vb.pp("conv1"))?;
-        let conv2 = Conv::new(2 * half, ch, Activation::SiLU, 1, 1, 0, 1, vb.pp("conv2"))?;
-        let num_head = half / 128;
-        let num_head = if num_head == 0 { 1 } else { num_head };
-        let vb_res = vb.pp("res_m");
+        let conv1 = ConvBn::new(ch, 2 * half, 1, 1, 0, 1, device);
+        let conv2 = ConvBn::new(2 * half, ch, 1, 1, 0, 1, device);
+        let num_head = (ch / 128).max(1);
         let mut res_m = Vec::with_capacity(n);
-        for i in 0..n {
-            res_m.push(PSABlock::new(half, num_head, vb_res.pp(i))?);
+        for _ in 0..n {
+            res_m.push(PSABlock::new(half, num_head, device));
         }
-        Ok(Self { conv1, conv2, res_m })
+        Self { conv1, conv2, res_m }
     }
 
-    pub fn forward(&self, x: &Tensor, training: bool) -> Result<Tensor> {
-        let c1 = self.conv1.forward(x, training)?;
-        let chunks = c1.chunk(2, 1)?;
-        let x_pass = &chunks[0];
-        let mut y = chunks[1].clone();
+    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+        let c1 = self.conv1.forward_silu(x);
+        let [_b, c, _h, _w] = c1.dims();
+        let half = c / 2;
+        let num_head = (c / 128).max(1);
+        let x_pass = c1.clone().narrow(1, 0, half);
+        let mut y = c1.narrow(1, half, c - half);
         for block in &self.res_m {
-            y = block.forward(&y, training)?;
+            y = block.forward(y, num_head);
         }
-        let cat = Tensor::cat(&[x_pass, &y], 1)?;
-        self.conv2.forward(&cat, training)
+        let cat = Tensor::cat(vec![x_pass, y], 1);
+        self.conv2.forward_silu(cat)
     }
 }

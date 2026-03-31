@@ -1,30 +1,31 @@
-use candle_core::{Result, Tensor};
-use candle_nn::VarBuilder;
+use burn::module::Module;
+use burn::nn::pool::{MaxPool2d, MaxPool2dConfig};
+use burn::prelude::*;
 
-use crate::model::conv::{Activation, Conv};
+use crate::model::conv::ConvBn;
 
 // ---------------------------------------------------------------------------
 // Residual
 // ---------------------------------------------------------------------------
 
-pub struct Residual {
-    conv1: Conv,
-    conv2: Conv,
+#[derive(Module, Debug)]
+pub struct Residual<B: Backend> {
+    conv1: ConvBn<B>,
+    conv2: ConvBn<B>,
 }
 
-impl Residual {
-    /// `e` controls the hidden-channel expansion ratio (0.5 or 1.0).
-    pub fn new(ch: usize, e: f64, vb: VarBuilder) -> Result<Self> {
+impl<B: Backend> Residual<B> {
+    pub fn new(ch: usize, e: f64, device: &B::Device) -> Self {
         let hid = (ch as f64 * e) as usize;
-        let conv1 = Conv::new(ch, hid, Activation::SiLU, 3, 1, 1, 1, vb.pp("conv1"))?;
-        let conv2 = Conv::new(hid, ch, Activation::SiLU, 3, 1, 1, 1, vb.pp("conv2"))?;
-        Ok(Self { conv1, conv2 })
+        let conv1 = ConvBn::new(ch, hid, 3, 1, 1, 1, device);
+        let conv2 = ConvBn::new(hid, ch, 3, 1, 1, 1, device);
+        Self { conv1, conv2 }
     }
 
-    pub fn forward(&self, x: &Tensor, training: bool) -> Result<Tensor> {
-        let y = self.conv1.forward(x, training)?;
-        let y = self.conv2.forward(&y, training)?;
-        x.add(&y)
+    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+        let y = self.conv1.forward_silu(x.clone());
+        let y = self.conv2.forward_silu(y);
+        x + y
     }
 }
 
@@ -32,66 +33,54 @@ impl Residual {
 // CSPModule
 // ---------------------------------------------------------------------------
 
-pub struct CSPModule {
-    conv1: Conv,
-    conv2: Conv,
-    conv3: Conv,
-    res_m: Vec<Residual>,
+#[derive(Module, Debug)]
+pub struct CSPModule<B: Backend> {
+    conv1: ConvBn<B>,
+    conv2: ConvBn<B>,
+    conv3: ConvBn<B>,
+    res_m: Vec<Residual<B>>,
 }
 
-impl CSPModule {
-    pub fn new(in_ch: usize, out_ch: usize, vb: VarBuilder) -> Result<Self> {
+impl<B: Backend> CSPModule<B> {
+    pub fn new(in_ch: usize, out_ch: usize, device: &B::Device) -> Self {
         let half = out_ch / 2;
-        let conv1 = Conv::new(in_ch, half, Activation::SiLU, 1, 1, 0, 1, vb.pp("conv1"))?;
-        let conv2 = Conv::new(in_ch, half, Activation::SiLU, 1, 1, 0, 1, vb.pp("conv2"))?;
-        let conv3 = Conv::new(2 * half, out_ch, Activation::SiLU, 1, 1, 0, 1, vb.pp("conv3"))?;
-        let vb_res = vb.pp("res_m");
-        let r0 = Residual::new(half, 1.0, vb_res.pp("0"))?;
-        let r1 = Residual::new(half, 1.0, vb_res.pp("1"))?;
-        Ok(Self {
+        let conv1 = ConvBn::new(in_ch, half, 1, 1, 0, 1, device);
+        let conv2 = ConvBn::new(in_ch, half, 1, 1, 0, 1, device);
+        let conv3 = ConvBn::new(2 * half, out_ch, 1, 1, 0, 1, device);
+        let r0 = Residual::new(half, 1.0, device);
+        let r1 = Residual::new(half, 1.0, device);
+        Self {
             conv1,
             conv2,
             conv3,
             res_m: vec![r0, r1],
-        })
+        }
     }
 
-    pub fn forward(&self, x: &Tensor, training: bool) -> Result<Tensor> {
-        let mut y = self.conv1.forward(x, training)?;
+    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+        let mut y = self.conv1.forward_silu(x.clone());
         for r in &self.res_m {
-            y = r.forward(&y, training)?;
+            y = r.forward(y);
         }
-        let z = self.conv2.forward(x, training)?;
-        let cat = Tensor::cat(&[&y, &z], 1)?;
-        self.conv3.forward(&cat, training)
+        let z = self.conv2.forward_silu(x);
+        let cat = Tensor::cat(vec![y, z], 1);
+        self.conv3.forward_silu(cat)
     }
 }
 
 // ---------------------------------------------------------------------------
-// CSP
+// CSP  (uses either Residual blocks or CSPModule blocks, never both)
 // ---------------------------------------------------------------------------
 
-pub enum CSPBlock {
-    Residual(Residual),
-    Module(CSPModule),
+#[derive(Module, Debug)]
+pub struct CSP<B: Backend> {
+    conv1: ConvBn<B>,
+    conv2: ConvBn<B>,
+    res_blocks: Vec<Residual<B>>,
+    csp_blocks: Vec<CSPModule<B>>,
 }
 
-impl CSPBlock {
-    pub fn forward(&self, x: &Tensor, training: bool) -> Result<Tensor> {
-        match self {
-            CSPBlock::Residual(r) => r.forward(x, training),
-            CSPBlock::Module(m) => m.forward(x, training),
-        }
-    }
-}
-
-pub struct CSP {
-    conv1: Conv,
-    conv2: Conv,
-    res_m: Vec<CSPBlock>,
-}
-
-impl CSP {
+impl<B: Backend> CSP<B> {
     /// `n` = number of blocks, `csp` = true → CSPModule blocks, false → Residual blocks.
     /// `r` = channel reduction ratio (2 or 4).
     pub fn new(
@@ -100,39 +89,48 @@ impl CSP {
         n: usize,
         csp: bool,
         r: usize,
-        vb: VarBuilder,
-    ) -> Result<Self> {
+        device: &B::Device,
+    ) -> Self {
         let mid = out_ch / r;
-        let conv1 = Conv::new(in_ch, 2 * mid, Activation::SiLU, 1, 1, 0, 1, vb.pp("conv1"))?;
+        let conv1 = ConvBn::new(in_ch, 2 * mid, 1, 1, 0, 1, device);
         let cat_ch = (2 + n) * mid;
-        let conv2 = Conv::new(cat_ch, out_ch, Activation::SiLU, 1, 1, 0, 1, vb.pp("conv2"))?;
+        let conv2 = ConvBn::new(cat_ch, out_ch, 1, 1, 0, 1, device);
 
-        let vb_res = vb.pp("res_m");
-        let mut res_m = Vec::with_capacity(n);
-        for i in 0..n {
-            let block = if csp {
-                CSPBlock::Module(CSPModule::new(mid, mid, vb_res.pp(i))?)
+        let mut res_blocks = Vec::new();
+        let mut csp_blocks = Vec::new();
+        for _ in 0..n {
+            if csp {
+                csp_blocks.push(CSPModule::new(mid, mid, device));
             } else {
-                CSPBlock::Residual(Residual::new(mid, 0.5, vb_res.pp(i))?)
-            };
-            res_m.push(block);
+                res_blocks.push(Residual::new(mid, 0.5, device));
+            }
         }
 
-        Ok(Self { conv1, conv2, res_m })
+        Self { conv1, conv2, res_blocks, csp_blocks }
     }
 
-    pub fn forward(&self, x: &Tensor, training: bool) -> Result<Tensor> {
-        let c1 = self.conv1.forward(x, training)?;
-        let chunks = c1.chunk(2, 1)?;
-        let mut parts: Vec<Tensor> = chunks.into_iter().collect();
-        for block in &self.res_m {
-            let last = parts.last().unwrap();
-            let next = block.forward(last, training)?;
-            parts.push(next);
+    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+        let c1 = self.conv1.forward_silu(x);
+        let [_b, c, _h, _w] = c1.dims();
+        let half = c / 2;
+        let first = c1.clone().narrow(1, 0, half);
+        let second = c1.narrow(1, half, c - half);
+        let mut parts: Vec<Tensor<B, 4>> = vec![first, second];
+
+        if !self.csp_blocks.is_empty() {
+            for block in &self.csp_blocks {
+                let last = parts.last().unwrap().clone();
+                parts.push(block.forward(last));
+            }
+        } else {
+            for block in &self.res_blocks {
+                let last = parts.last().unwrap().clone();
+                parts.push(block.forward(last));
+            }
         }
-        let refs: Vec<&Tensor> = parts.iter().collect();
-        let cat = Tensor::cat(&refs, 1)?;
-        self.conv2.forward(&cat, training)
+
+        let cat = Tensor::cat(parts, 1);
+        self.conv2.forward_silu(cat)
     }
 }
 
@@ -140,30 +138,31 @@ impl CSP {
 // SPP  (Spatial Pyramid Pooling)
 // ---------------------------------------------------------------------------
 
-pub struct SPP {
-    conv1: Conv,
-    conv2: Conv,
-    k: usize,
+#[derive(Module, Debug)]
+pub struct SPP<B: Backend> {
+    conv1: ConvBn<B>,
+    conv2: ConvBn<B>,
+    pool: MaxPool2d,
 }
 
-impl SPP {
-    pub fn new(in_ch: usize, out_ch: usize, k: usize, vb: VarBuilder) -> Result<Self> {
-        let conv1 = Conv::new(in_ch, in_ch / 2, Activation::SiLU, 1, 1, 0, 1, vb.pp("conv1"))?;
-        let conv2 = Conv::new(in_ch * 2, out_ch, Activation::SiLU, 1, 1, 0, 1, vb.pp("conv2"))?;
-        Ok(Self { conv1, conv2, k })
+impl<B: Backend> SPP<B> {
+    pub fn new(in_ch: usize, out_ch: usize, k: usize, device: &B::Device) -> Self {
+        let conv1 = ConvBn::new(in_ch, in_ch / 2, 1, 1, 0, 1, device);
+        let conv2 = ConvBn::new(in_ch * 2, out_ch, 1, 1, 0, 1, device);
+        let p = k / 2;
+        let pool = MaxPool2dConfig::new([k, k])
+            .with_strides([1, 1])
+            .with_padding(burn::nn::PaddingConfig2d::Explicit(p, p))
+            .init();
+        Self { conv1, conv2, pool }
     }
 
-    pub fn forward(&self, x: &Tensor, training: bool) -> Result<Tensor> {
-        let x = self.conv1.forward(x, training)?;
-        let p = self.k / 2;
-        // Pad and max-pool with stride=1 to keep spatial dims
-        let y1 = x.pad_with_zeros(2, p, p)?.pad_with_zeros(3, p, p)?;
-        let y1 = y1.max_pool2d_with_stride(self.k, 1)?;
-        let y2 = y1.pad_with_zeros(2, p, p)?.pad_with_zeros(3, p, p)?;
-        let y2 = y2.max_pool2d_with_stride(self.k, 1)?;
-        let y3 = y2.pad_with_zeros(2, p, p)?.pad_with_zeros(3, p, p)?;
-        let y3 = y3.max_pool2d_with_stride(self.k, 1)?;
-        let cat = Tensor::cat(&[&x, &y1, &y2, &y3], 1)?;
-        self.conv2.forward(&cat, training)
+    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+        let x = self.conv1.forward_silu(x);
+        let y1 = self.pool.forward(x.clone());
+        let y2 = self.pool.forward(y1.clone());
+        let y3 = self.pool.forward(y2.clone());
+        let cat = Tensor::cat(vec![x, y1, y2, y3], 1);
+        self.conv2.forward_silu(cat)
     }
 }
