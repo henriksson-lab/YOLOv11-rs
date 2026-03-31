@@ -146,12 +146,18 @@ where
                 continue;
             }
 
+            print!("  step {}/{}: collate..", step_in_epoch + 1, num_steps);
+            std::io::stdout().flush().ok();
             let batch = dataset::collate(&samples, device);
             let images = batch.images;
 
+            print!("fwd..");
+            std::io::stdout().flush().ok();
             // Forward
             let outputs = model.forward_train(images);
 
+            print!("loss..");
+            std::io::stdout().flush().ok();
             // Loss
             let (loss_box, loss_cls, loss_dfl) = criterion.compute(
                 &outputs,
@@ -166,6 +172,8 @@ where
             let total_loss = loss_box.clone() + loss_cls.clone() + loss_dfl.clone();
             let scaled_loss = total_loss * (batch_size as f64 * world_size as f64);
 
+            print!("backward..");
+            std::io::stdout().flush().ok();
             // Optimizer step with gradient accumulation
             if global_step % accumulate == 0 {
                 let grads = scaled_loss.backward();
@@ -184,6 +192,11 @@ where
             avg_cls += (lc as f64 - avg_cls) / count as f64;
             avg_dfl += (ld as f64 - avg_dfl) / count as f64;
 
+            println!(
+                "done | box: {:.3} cls: {:.3} dfl: {:.3}",
+                avg_box, avg_cls, avg_dfl
+            );
+            std::io::stdout().flush().ok();
             pb.set_message(format!(
                 "{:>5}/{:<5} {:>8} {:>8.3} {:>8.3} {:>8.3}",
                 epoch + 1,

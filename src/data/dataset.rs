@@ -374,9 +374,18 @@ pub fn collate<B: Backend>(
     }
 
     let n = all_cls.len();
-    let cls = Tensor::<B, 1>::from_floats(all_cls.as_slice(), device).reshape([n, 1]);
-    let bbox = Tensor::<B, 1>::from_floats(all_bbox.as_slice(), device).reshape([n, 4]);
-    let idx = Tensor::<B, 1>::from_floats(all_idx.as_slice(), device);
+    // Burn does not support 0-element tensors; use a dummy target when batch has no labels
+    let (cls, bbox, idx) = if n == 0 {
+        let cls = Tensor::<B, 2>::zeros([1, 1], device);
+        let bbox = Tensor::<B, 2>::zeros([1, 4], device);
+        let idx = Tensor::<B, 1>::from_floats([-1.0f32].as_slice(), device);
+        (cls, bbox, idx)
+    } else {
+        let cls = Tensor::<B, 1>::from_floats(all_cls.as_slice(), device).reshape([n, 1]);
+        let bbox = Tensor::<B, 1>::from_floats(all_bbox.as_slice(), device).reshape([n, 4]);
+        let idx = Tensor::<B, 1>::from_floats(all_idx.as_slice(), device);
+        (cls, bbox, idx)
+    };
 
     Batch { images, cls, bbox, idx }
 }

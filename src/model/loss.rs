@@ -358,6 +358,13 @@ impl ComputeLoss {
         let mut total_fg = 0usize;
 
         let target_idx_vec: Vec<f32> = target_idx.to_data().to_vec().unwrap();
+
+        // Handle empty targets (dummy idx=-1 from collate): return zero losses
+        if target_idx_vec.is_empty() || (target_idx_vec.len() == 1 && target_idx_vec[0] < 0.0) {
+            let zero = Tensor::<B, 1>::zeros([1], device);
+            return (zero.clone(), zero.clone(), zero);
+        }
+
         let target_cls_vec: Vec<f32> = target_cls.clone().squeeze::<1>(1).to_data().to_vec().unwrap();
         let target_box_data: Vec<f32> = target_box_pixel.to_data().to_vec().unwrap();
         let num_targets = target_idx_vec.len();
@@ -420,8 +427,8 @@ impl ComputeLoss {
 
             if fg_count == 0 {
                 let cls_target = Tensor::<B, 2>::zeros([total_a, self.nc], device);
-                let cls_loss = bce_with_logits(&ps, &cls_target).sum();
-                total_cls_loss = total_cls_loss + cls_loss.unsqueeze_dim(0);
+                let cls_loss = bce_with_logits(&ps, &cls_target).sum_dim(1).sum_dim(0).squeeze(0);
+                total_cls_loss = total_cls_loss + cls_loss;
                 continue;
             }
 
@@ -437,8 +444,8 @@ impl ComputeLoss {
             }
             let cls_target = Tensor::<B, 1>::from_floats(cls_target_data.as_slice(), device)
                 .reshape([total_a, self.nc]);
-            let cls_loss = bce_with_logits(&ps, &cls_target).sum();
-            total_cls_loss = total_cls_loss + cls_loss.unsqueeze_dim(0);
+            let cls_loss = bce_with_logits(&ps, &cls_target).sum_dim(1).sum_dim(0).squeeze(0);
+            total_cls_loss = total_cls_loss + cls_loss;
 
             // Box loss (CIoU) on foreground
             let fg_indices: Vec<usize> = assign
@@ -465,7 +472,7 @@ impl ComputeLoss {
 
             let (ciou, _iou) = compute_ciou(&fg_pred_boxes, &fg_target_boxes);
             let box_loss = ((-ciou) + 1.0).mean();
-            total_box_loss = total_box_loss + box_loss.unsqueeze_dim(0);
+            total_box_loss = total_box_loss + box_loss;
 
             // DFL loss on foreground
             let pred_dist_b = pred_dist.clone().narrow(0, b, 1).squeeze::<2>(0); // [4*ch, A]
@@ -497,7 +504,7 @@ impl ComputeLoss {
 
             let dfl_l = df_loss::<B>(&fg_pred_dist, &dfl_target, self.ch, device);
             let dfl_loss = dfl_l.mean();
-            total_dfl_loss = total_dfl_loss + dfl_loss.unsqueeze_dim(0);
+            total_dfl_loss = total_dfl_loss + dfl_loss;
         }
 
         // Normalize by total foreground count

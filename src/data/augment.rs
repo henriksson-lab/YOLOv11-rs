@@ -94,13 +94,13 @@ pub fn random_perspective(
     let h = h as u32;
     let w = w as u32;
 
-    // Build affine matrix components
-    let angle = rng.gen_range(-degrees..degrees);
-    let s = rng.gen_range(1.0 - scale..1.0 + scale);
-    let sh_x = (rng.gen_range(-shear..shear) * std::f32::consts::PI / 180.0).tan();
-    let sh_y = (rng.gen_range(-shear..shear) * std::f32::consts::PI / 180.0).tan();
-    let tx = rng.gen_range(0.5 - translate..0.5 + translate) * w as f32;
-    let ty = rng.gen_range(0.5 - translate..0.5 + translate) * h as f32;
+    // Build affine matrix components (guard against empty ranges when param is 0)
+    let angle = if degrees > 0.0 { rng.gen_range(-degrees..degrees) } else { 0.0 };
+    let s = if scale > 0.0 { rng.gen_range(1.0 - scale..1.0 + scale) } else { 1.0 };
+    let sh_x = if shear > 0.0 { (rng.gen_range(-shear..shear) * std::f32::consts::PI / 180.0).tan() } else { 0.0 };
+    let sh_y = if shear > 0.0 { (rng.gen_range(-shear..shear) * std::f32::consts::PI / 180.0).tan() } else { 0.0 };
+    let tx = if translate > 0.0 { rng.gen_range(0.5 - translate..0.5 + translate) * w as f32 } else { 0.5 * w as f32 };
+    let ty = if translate > 0.0 { rng.gen_range(0.5 - translate..0.5 + translate) * h as f32 } else { 0.5 * h as f32 };
 
     let cos_a = (angle * std::f32::consts::PI / 180.0).cos() * s;
     let sin_a = (angle * std::f32::consts::PI / 180.0).sin() * s;
