@@ -1,6 +1,6 @@
 use candle_core::{DType, Result, Tensor};
 
-use crate::anchors;
+use crate::model::anchors;
 
 // ---------------------------------------------------------------------------
 // CIoU loss (Complete IoU)
@@ -384,7 +384,7 @@ impl ComputeLoss {
 
         // Generate anchors
         let (anchor_points, strides) =
-            crate::anchors::make_anchors(outputs, &self.stride, 0.5)?;
+            crate::model::anchors::make_anchors(outputs, &self.stride, 0.5)?;
         // anchor_points: [A, 2], strides: [A, 1]
 
         let total_a = anchor_points.dims()[0];

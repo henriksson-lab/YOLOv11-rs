@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::augment;
-use crate::resize;
+use crate::data::augment;
+use crate::data::resize;
 
 /// A single label entry: (class, cx, cy, w, h) all in [0,1] normalized coords.
 #[derive(Debug, Clone, Serialize, Deserialize)]

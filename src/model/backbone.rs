@@ -1,9 +1,9 @@
 use candle_core::{Result, Tensor};
 use candle_nn::VarBuilder;
 
-use crate::attention::PSA;
-use crate::blocks::{CSP, SPP};
-use crate::conv::{Activation, Conv};
+use crate::model::attention::PSA;
+use crate::model::blocks::{CSP, SPP};
+use crate::model::conv::{Activation, Conv};
 
 /// DarkNet backbone. Outputs feature maps at 3 scales: p3 (8x), p4 (16x), p5 (32x).
 pub struct DarkNet {

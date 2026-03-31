@@ -1,8 +1,8 @@
 use candle_core::{Device, Result, Tensor};
 use candle_nn::{Module, VarBuilder};
 
-use crate::anchors::make_anchors;
-use crate::conv::{Activation, Conv};
+use crate::model::anchors::make_anchors;
+use crate::model::conv::{Activation, Conv};
 
 // ---------------------------------------------------------------------------
 // DFL  (Distribution Focal Loss decoder)

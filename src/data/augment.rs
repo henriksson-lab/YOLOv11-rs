@@ -1,7 +1,7 @@
 use image::RgbImage;
 use rand::Rng;
 
-use crate::dataset::Label;
+use crate::data::dataset::Label;
 
 /// HSV color-space augmentation.
 pub fn augment_hsv(img: &mut RgbImage, h_gain: f32, s_gain: f32, v_gain: f32) {

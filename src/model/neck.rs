@@ -1,8 +1,8 @@
 use candle_core::{Result, Tensor};
 use candle_nn::VarBuilder;
 
-use crate::blocks::CSP;
-use crate::conv::{Activation, Conv};
+use crate::model::blocks::CSP;
+use crate::model::conv::{Activation, Conv};
 
 /// DarkFPN neck – fuses multi-scale features from backbone.
 pub struct DarkFPN {

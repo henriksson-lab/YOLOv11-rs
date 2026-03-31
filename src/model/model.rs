@@ -1,9 +1,9 @@
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::VarBuilder;
 
-use crate::backbone::DarkNet;
-use crate::head::Head;
-use crate::neck::DarkFPN;
+use crate::model::backbone::DarkNet;
+use crate::model::head::Head;
+use crate::model::neck::DarkFPN;
 
 pub struct YOLO {
     pub net: DarkNet,

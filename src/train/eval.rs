@@ -2,10 +2,10 @@ use anyhow::Result;
 use candle_core::Device;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use yolo_data::dataset::{self, Dataset, Sample};
-use yolo_model::metrics::{self, MatchResult};
-use yolo_model::model::YOLO;
-use yolo_model::nms;
+use crate::data::dataset::{self, Dataset, Sample};
+use crate::model::metrics::{self, MatchResult};
+use crate::model::model::YOLO;
+use crate::model::nms;
 
 /// Run evaluation on the validation set.
 /// Returns (mAP, mAP50, recall, precision).

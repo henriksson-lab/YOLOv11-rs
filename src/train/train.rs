@@ -5,13 +5,13 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rand::seq::SliceRandom;
 use std::io::Write;
 
-use yolo_data::dataset::{self, Dataset, Sample};
-use yolo_model::loss::ComputeLoss;
+use crate::data::dataset::{self, Dataset, Sample};
+use crate::model::loss::ComputeLoss;
 
-use crate::config::Config;
-use crate::ema::EMA;
-use crate::eval;
-use crate::lr_schedule::LinearLR;
+use crate::train::config::Config;
+use crate::train::ema::EMA;
+use crate::train::eval;
+use crate::train::lr_schedule::LinearLR;
 
 pub fn train(
     config: &Config,
@@ -26,7 +26,7 @@ pub fn train(
     // Create model
     let varmap = VarMap::new();
     let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, device);
-    let model = yolo_model::model::yolo_v11_n(num_classes, device, vb)?;
+    let model = crate::model::model::yolo_v11_n(num_classes, device, vb)?;
 
     // Optimizer
     let world_size = 1usize;

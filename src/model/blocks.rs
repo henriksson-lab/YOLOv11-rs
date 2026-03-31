@@ -1,7 +1,7 @@
 use candle_core::{Result, Tensor};
 use candle_nn::VarBuilder;
 
-use crate::conv::{Activation, Conv};
+use crate::model::conv::{Activation, Conv};
 
 // ---------------------------------------------------------------------------
 // Residual

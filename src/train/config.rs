@@ -93,8 +93,8 @@ impl Config {
         self.dfl.unwrap_or(1.5)
     }
 
-    pub fn to_augment_params(&self) -> yolo_data::dataset::AugmentParams {
-        yolo_data::dataset::AugmentParams {
+    pub fn to_augment_params(&self) -> crate::data::dataset::AugmentParams {
+        crate::data::dataset::AugmentParams {
             hsv_h: self.hsv_h,
             hsv_s: self.hsv_s,
             hsv_v: self.hsv_v,
