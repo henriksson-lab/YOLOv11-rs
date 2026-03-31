@@ -7,7 +7,7 @@ use std::io::Write;
 
 use crate::data::dataset::{self, Dataset, Sample};
 use crate::model::loss::ComputeLoss;
-use crate::model::model::YOLO;
+use crate::model::model::{ModelVariant, YOLO};
 
 use crate::train::config::Config;
 use crate::train::ema::EMA;
@@ -17,6 +17,7 @@ use crate::train::lr_schedule::LinearLR;
 pub fn train<B: Backend>(
     config: &Config,
     data_dir: &str,
+    variant: ModelVariant,
     input_size: usize,
     batch_size: usize,
     epochs: usize,
@@ -28,7 +29,7 @@ where
     let num_classes = config.num_classes();
 
     // Create model
-    let model: YOLO<B> = crate::model::model::yolo_v11_n(num_classes, device);
+    let model: YOLO<B> = crate::model::model::build_yolo(variant, num_classes, device);
 
     // Optimizer
     let world_size = 1usize;

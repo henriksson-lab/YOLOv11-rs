@@ -1,9 +1,35 @@
 use burn::module::Module;
 use burn::prelude::*;
+use clap::ValueEnum;
 
 use crate::model::backbone::DarkNet;
 use crate::model::head::Head;
 use crate::model::neck::DarkFPN;
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ModelVariant {
+    N,
+    T,
+    S,
+    M,
+    L,
+    X,
+}
+
+pub fn build_yolo<B: Backend>(
+    variant: ModelVariant,
+    num_classes: usize,
+    device: &B::Device,
+) -> YOLO<B> {
+    match variant {
+        ModelVariant::N => yolo_v11_n(num_classes, device),
+        ModelVariant::T => yolo_v11_t(num_classes, device),
+        ModelVariant::S => yolo_v11_s(num_classes, device),
+        ModelVariant::M => yolo_v11_m(num_classes, device),
+        ModelVariant::L => yolo_v11_l(num_classes, device),
+        ModelVariant::X => yolo_v11_x(num_classes, device),
+    }
+}
 
 #[derive(Module, Debug)]
 pub struct YOLO<B: Backend> {

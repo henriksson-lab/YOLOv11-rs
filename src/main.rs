@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 
 use yolov11::data;
 use yolov11::model;
+use yolov11::model::model::ModelVariant;
 use yolov11::train;
 
 type MyBackend = Wgpu;
@@ -30,6 +31,10 @@ enum Command {
         /// Path to dataset root (COCO format)
         #[arg(long)]
         data_dir: String,
+
+        /// Model variant
+        #[arg(long, value_enum, default_value_t = ModelVariant::N)]
+        model: ModelVariant,
 
         /// Input image size
         #[arg(long, default_value_t = 640)]
@@ -57,6 +62,10 @@ enum Command {
         #[arg(long)]
         data_dir: String,
 
+        /// Model variant
+        #[arg(long, value_enum, default_value_t = ModelVariant::N)]
+        model: ModelVariant,
+
         /// Input image size
         #[arg(long, default_value_t = 640)]
         input_size: usize,
@@ -76,6 +85,7 @@ fn main() -> Result<()> {
         Command::Train {
             config,
             data_dir,
+            model: variant,
             input_size,
             batch_size,
             epochs,
@@ -83,31 +93,34 @@ fn main() -> Result<()> {
         } => {
             let config = train::config::Config::load(&std::path::PathBuf::from(&config))?;
             println!("Loaded config with {} classes", config.num_classes());
+            println!("Model variant: {:?}", variant);
 
             // Profile model
             {
                 let model: model::model::YOLO<MyBackend> =
-                    model::model::yolo_v11_n(config.num_classes(), &device);
+                    model::model::build_yolo(variant, config.num_classes(), &device);
                 let total_params = model.num_params();
                 println!("Number of parameters: {:.3}M", total_params as f64 / 1e6);
             }
 
             train::train::train::<MyAutodiffBackend>(
-                &config, &data_dir, input_size, batch_size, epochs, &device,
+                &config, &data_dir, variant, input_size, batch_size, epochs, &device,
             )?;
         }
         Command::Test {
             config,
             data_dir,
+            model: variant,
             input_size,
             weights,
         } => {
             let config = train::config::Config::load(&std::path::PathBuf::from(&config))?;
             let num_classes = config.num_classes();
             println!("Loaded config with {} classes", num_classes);
+            println!("Model variant: {:?}", variant);
 
             let model: model::model::YOLO<MyBackend> =
-                model::model::yolo_v11_n(num_classes, &device);
+                model::model::build_yolo(variant, num_classes, &device);
 
             // Load weights if provided
             let model = if let Some(weights_path) = weights {
