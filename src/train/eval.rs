@@ -1,6 +1,7 @@
 use anyhow::Result;
 use candle_core::Device;
 use indicatif::{ProgressBar, ProgressStyle};
+use std::time::Instant;
 
 use crate::data::dataset::{self, Dataset, Sample};
 use crate::model::metrics::{self, MatchResult};
@@ -32,10 +33,17 @@ pub fn test(
 
     let mut all_results: Vec<MatchResult> = Vec::new();
 
+    let mut total_data_time = std::time::Duration::ZERO;
+    let mut total_forward_time = std::time::Duration::ZERO;
+    let mut total_nms_time = std::time::Duration::ZERO;
+    let mut total_metric_time = std::time::Duration::ZERO;
+    let eval_start = Instant::now();
+
     for batch_idx in 0..num_batches {
         let start = batch_idx * batch_size;
         let end = (start + batch_size).min(n);
 
+        let t0 = Instant::now();
         let mut samples: Vec<Sample> = Vec::new();
         for i in start..end {
             samples.push(dataset.get(i, device)?);
@@ -43,14 +51,20 @@ pub fn test(
 
         let batch = dataset::collate(&samples, device)?;
         let images = batch.images; // [B, 3, H, W] already in 0..1
+        total_data_time += t0.elapsed();
 
         // Forward (inference)
+        let t1 = Instant::now();
         let output = model.forward_infer(&images)?; // [B, 4+nc, A]
+        total_forward_time += t1.elapsed();
 
         // NMS
+        let t2 = Instant::now();
         let detections = nms::batch_nms(&output, 0.001, 0.65, 300)?;
+        total_nms_time += t2.elapsed();
 
         // Match against GT
+        let t3 = Instant::now();
         let gt_cls: Vec<f32> = batch.cls.squeeze(1)?.to_vec1()?;
         let gt_bbox: Vec<Vec<f32>> = (0..batch.bbox.dims()[0])
             .map(|i| batch.bbox.get(i).unwrap().to_vec1::<f32>().unwrap())
@@ -88,10 +102,12 @@ pub fn test(
             let result = metrics::compute_metric(&pred_boxes, &gt_boxes, &iou_thresholds);
             all_results.push(result);
         }
+        total_metric_time += t3.elapsed();
 
         pb.inc(1);
     }
 
+    let total_elapsed = eval_start.elapsed();
     pb.finish_with_message("Done");
 
     let (mean_ap, map50, recall, precision) = metrics::compute_ap(&all_results, num_classes);
@@ -99,6 +115,16 @@ pub fn test(
         "  Precision: {:.3}  Recall: {:.3}  mAP@50: {:.3}  mAP@50:95: {:.3}",
         precision, recall, map50, mean_ap
     );
+
+    // Timing summary
+    let n_images = n as f64;
+    println!("\n  Benchmark ({} images, batch_size={}):", n, batch_size);
+    println!("    Data loading:  {:>8.1}ms total, {:>6.2}ms/img", total_data_time.as_secs_f64() * 1e3, total_data_time.as_secs_f64() * 1e3 / n_images);
+    println!("    Forward pass:  {:>8.1}ms total, {:>6.2}ms/img", total_forward_time.as_secs_f64() * 1e3, total_forward_time.as_secs_f64() * 1e3 / n_images);
+    println!("    NMS:           {:>8.1}ms total, {:>6.2}ms/img", total_nms_time.as_secs_f64() * 1e3, total_nms_time.as_secs_f64() * 1e3 / n_images);
+    println!("    Metrics:       {:>8.1}ms total, {:>6.2}ms/img", total_metric_time.as_secs_f64() * 1e3, total_metric_time.as_secs_f64() * 1e3 / n_images);
+    println!("    Total:         {:>8.1}ms total, {:>6.2}ms/img", total_elapsed.as_secs_f64() * 1e3, total_elapsed.as_secs_f64() * 1e3 / n_images);
+    println!("    Throughput:    {:.1} img/s", n_images / total_elapsed.as_secs_f64());
 
     Ok((mean_ap, map50, recall, precision))
 }
