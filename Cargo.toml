@@ -1,0 +1,10 @@
+[workspace]
+members = ["yolo-model", "yolo-data", "yolo-train"]
+resolver = "2"
+
+[workspace.dependencies]
+candle-core = "0.8"
+candle-nn = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+anyhow = "1"
