@@ -146,7 +146,25 @@ impl Dataset {
 
     fn load_image(&self, index: usize) -> Result<image::DynamicImage> {
         let path = &self.filenames[index];
-        image::open(path).with_context(|| format!("Failed to load image: {}", path.display()))
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
+            let data = fs::read(path)
+                .with_context(|| format!("Failed to read image: {}", path.display()))?;
+            let mut decoder = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(&data));
+            decoder.decode_headers()
+                .map_err(|e| anyhow::anyhow!("JPEG header error for {}: {:?}", path.display(), e))?;
+            let info = decoder.info()
+                .ok_or_else(|| anyhow::anyhow!("No JPEG info for {}", path.display()))?;
+            let (w, h) = (info.width as u32, info.height as u32);
+            let pixels = decoder.decode()
+                .map_err(|e| anyhow::anyhow!("JPEG decode error for {}: {:?}", path.display(), e))?;
+            let rgb = image::RgbImage::from_raw(w, h, pixels)
+                .ok_or_else(|| anyhow::anyhow!("Bad JPEG buffer size for {}", path.display()))?;
+            Ok(image::DynamicImage::ImageRgb8(rgb))
+        } else {
+            image::open(path)
+                .with_context(|| format!("Failed to load image: {}", path.display()))
+        }
     }
 
     fn load_mosaic(&self, indices: &[usize]) -> Result<(image::RgbImage, Vec<Label>)> {

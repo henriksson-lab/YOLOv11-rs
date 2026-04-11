@@ -5,10 +5,10 @@ edition = "2021"
 
 [features]
 default = []
-cuda = ["burn/candle-cuda"]
+cuda = ["burn/cuda-jit"]
 
 [dependencies]
-burn = { version = "0.16", features = ["train", "wgpu"] }
+burn = { version = "0.16.1", features = ["train", "wgpu"] }
 burn-import = { version = "0.16", features = ["pytorch"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
@@ -20,3 +20,4 @@ rayon = "1"
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 csv = "1"
+zune-jpeg = "0.5"

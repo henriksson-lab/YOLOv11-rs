@@ -14,32 +14,30 @@ pub struct Detection {
 
 /// Apply NMS to model output for a single image.
 ///
-/// `preds` is shaped [num_anchors][4+nc] (cx, cy, w, h, cls_scores...).
+/// `preds` is a flat slice of [num_anchors * stride] where stride = 4 + nc.
 /// Returns up to `max_det` detections per image.
 pub fn non_max_suppression(
-    preds: &[Vec<f32>],
+    preds: &[f32],
+    stride: usize,
+    num_anchors: usize,
     conf_threshold: f32,
     iou_threshold: f32,
     max_det: usize,
 ) -> Vec<Detection> {
-    let nc = if preds.is_empty() {
-        return Vec::new();
-    } else {
-        preds[0].len() - 4
-    };
-
     let mut candidates: Vec<Detection> = Vec::new();
-    for pred in preds {
-        let cx = pred[0];
-        let cy = pred[1];
-        let w = pred[2];
-        let h = pred[3];
+    for i in 0..num_anchors {
+        let base = i * stride;
+        let cx = preds[base];
+        let cy = preds[base + 1];
+        let w = preds[base + 2];
+        let h = preds[base + 3];
 
+        let cls_scores = &preds[base + 4..base + stride];
         let mut max_score = 0.0f32;
         let mut max_cls = 0usize;
-        for c in 0..nc {
-            if pred[4 + c] > max_score {
-                max_score = pred[4 + c];
+        for (c, &score) in cls_scores.iter().enumerate() {
+            if score > max_score {
+                max_score = score;
                 max_cls = c;
             }
         }
@@ -58,18 +56,29 @@ pub fn non_max_suppression(
         });
     }
 
-    candidates.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+    candidates.sort_unstable_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
 
-    let mut keep: Vec<Detection> = Vec::new();
-    while !candidates.is_empty() && keep.len() < max_det {
-        let best = candidates.remove(0);
-        candidates.retain(|c| {
-            if c.class != best.class {
-                return true;
+    // Greedy NMS using a suppressed flag instead of Vec::remove(0)
+    let mut suppressed = vec![false; candidates.len()];
+    let mut keep: Vec<Detection> = Vec::with_capacity(max_det);
+
+    for i in 0..candidates.len() {
+        if suppressed[i] {
+            continue;
+        }
+        if keep.len() >= max_det {
+            break;
+        }
+        // Suppress lower-confidence overlapping detections of the same class
+        for j in (i + 1)..candidates.len() {
+            if !suppressed[j]
+                && candidates[j].class == candidates[i].class
+                && iou_single(&candidates[i], &candidates[j]) >= iou_threshold
+            {
+                suppressed[j] = true;
             }
-            iou_single(&best, c) < iou_threshold
-        });
-        keep.push(best);
+        }
+        keep.push(candidates[i].clone());
     }
 
     keep
@@ -98,18 +107,21 @@ pub fn batch_nms<B: Backend>(
     iou_threshold: f32,
     max_det: usize,
 ) -> Vec<Vec<Detection>> {
-    let [batch, _no, num_a] = output.dims();
+    let [batch, stride, num_a] = output.dims();
     let mut results = Vec::with_capacity(batch);
 
     for b in 0..batch {
-        let img_out = output.clone().narrow(0, b, 1).squeeze::<2>(0); // [4+nc, A]
-        let img_out = img_out.swap_dims(0, 1); // [A, 4+nc]
+        let img_out = output.clone().narrow(0, b, 1).squeeze::<2>(0); // [stride, A]
+        let img_out = img_out.swap_dims(0, 1); // [A, stride]
         let data: Vec<f32> = img_out.to_data().to_vec().unwrap();
-        let no = _no;
-        let preds: Vec<Vec<f32>> = (0..num_a)
-            .map(|i| data[i * no..(i + 1) * no].to_vec())
-            .collect();
-        results.push(non_max_suppression(&preds, conf_threshold, iou_threshold, max_det));
+        results.push(non_max_suppression(
+            &data,
+            stride,
+            num_a,
+            conf_threshold,
+            iou_threshold,
+            max_det,
+        ));
     }
     results
 }

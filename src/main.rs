@@ -1,16 +1,24 @@
 use anyhow::Result;
-use burn::backend::wgpu::{Wgpu, WgpuDevice};
 use burn::backend::Autodiff;
 use burn::prelude::*;
 use burn::record::Recorder;
 use clap::{Parser, Subcommand};
+
+#[cfg(feature = "cuda")]
+use burn::backend::{CudaJit, cuda_jit::CudaDevice};
+#[cfg(not(feature = "cuda"))]
+use burn::backend::wgpu::{Wgpu, WgpuDevice};
 
 use yolov11::data;
 use yolov11::model;
 use yolov11::model::model::ModelVariant;
 use yolov11::train;
 
+#[cfg(feature = "cuda")]
+type MyBackend = CudaJit;
+#[cfg(not(feature = "cuda"))]
 type MyBackend = Wgpu;
+
 type MyAutodiffBackend = Autodiff<MyBackend>;
 
 #[derive(Parser, Debug)]
@@ -78,7 +86,14 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    #[cfg(feature = "cuda")]
+    let device = CudaDevice::default();
+    #[cfg(not(feature = "cuda"))]
     let device = WgpuDevice::default();
+
+    #[cfg(feature = "cuda")]
+    println!("Using device: CUDA");
+    #[cfg(not(feature = "cuda"))]
     println!("Using device: Wgpu");
 
     match cli.command {
