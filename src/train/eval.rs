@@ -64,7 +64,7 @@ pub fn test<B: Backend>(
 
         // Match against GT
         let t3 = Instant::now();
-        let gt_cls: Vec<f32> = batch.cls.clone().squeeze::<1>(1).to_data().to_vec().unwrap();
+        let gt_cls: Vec<f32> = batch.cls.clone().squeeze::<1>().to_data().to_vec().unwrap();
         let gt_bbox_data: Vec<f32> = batch.bbox.to_data().to_vec().unwrap();
         let num_gt = gt_cls.len();
         let gt_bbox: Vec<[f32; 4]> = (0..num_gt)

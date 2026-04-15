@@ -1,11 +1,10 @@
 use anyhow::Result;
 use burn::backend::Autodiff;
 use burn::prelude::*;
-use burn::record::Recorder;
 use clap::{Parser, Subcommand};
 
 #[cfg(feature = "cuda")]
-use burn::backend::{CudaJit, cuda_jit::CudaDevice};
+use burn::backend::{Cuda, cuda::CudaDevice};
 #[cfg(not(feature = "cuda"))]
 use burn::backend::wgpu::{Wgpu, WgpuDevice};
 
@@ -15,7 +14,7 @@ use yolov11::model::model::ModelVariant;
 use yolov11::train;
 
 #[cfg(feature = "cuda")]
-type MyBackend = CudaJit;
+type MyBackend = Cuda;
 #[cfg(not(feature = "cuda"))]
 type MyBackend = Wgpu;
 
@@ -140,13 +139,18 @@ fn main() -> Result<()> {
             // Load weights if provided
             let model = if let Some(weights_path) = weights {
                 if weights_path.ends_with(".pt") || weights_path.ends_with(".pth") {
-                    println!("Loading PyTorch weights from {}", weights_path);
-                    println!("  (use convert_weights.py first if keys are not remapped)");
-                    let recorder = burn_import::pytorch::PyTorchFileRecorder::<burn::record::FullPrecisionSettings>::default();
-                    let args = burn_import::pytorch::LoadArgs::new(weights_path.into());
-                    let record = recorder.load(args, &device)
-                        .map_err(|e| anyhow::anyhow!("Failed to load PyTorch weights: {}", e))?;
-                    model.load_record(record)
+                    anyhow::bail!(
+                        "Direct .pt loading is not supported in burn 0.21 pre-release \
+                         (broken transitive dep). Convert to .safetensors first."
+                    );
+                } else if weights_path.ends_with(".safetensors") {
+                    println!("Loading safetensors weights from {}", weights_path);
+                    use burn_store::ModuleSnapshot;
+                    let mut model = model;
+                    let mut store = burn_store::SafetensorsStore::from_file(&weights_path);
+                    model.load_from(&mut store)
+                        .map_err(|e| anyhow::anyhow!("Failed to load safetensors weights: {}", e))?;
+                    model
                 } else {
                     println!("Loading weights from {}", weights_path);
                     model

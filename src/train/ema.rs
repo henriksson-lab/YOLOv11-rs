@@ -1,4 +1,4 @@
-use burn::module::{Module, ModuleMapper, ModuleVisitor, ParamId};
+use burn::module::{Module, ModuleMapper, ModuleVisitor, Param};
 use burn::prelude::*;
 use burn::tensor::TensorData;
 use std::collections::HashMap;
@@ -17,8 +17,8 @@ impl ParamCollector {
 }
 
 impl<B: Backend> ModuleVisitor<B> for ParamCollector {
-    fn visit_float<const D: usize>(&mut self, id: ParamId, tensor: &Tensor<B, D>) {
-        self.params.insert(id.val(), tensor.to_data());
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        self.params.insert(param.id.val(), param.val().to_data());
     }
 }
 
@@ -30,13 +30,14 @@ struct EmaMapper<B: Backend> {
 }
 
 impl<B: Backend> ModuleMapper<B> for EmaMapper<B> {
-    fn map_float<const D: usize>(&mut self, id: ParamId, tensor: Tensor<B, D>) -> Tensor<B, D> {
-        if let Some(source_data) = self.source_params.get(&id.val()) {
+    fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+        if let Some(source_data) = self.source_params.get(&param.id.val()) {
             let source = Tensor::<B, D>::from_data(source_data.clone(), &self.device);
             // ema = decay * ema + (1 - decay) * model
-            tensor * self.decay + source * (1.0 - self.decay)
+            let blended = param.val() * self.decay + source * (1.0 - self.decay);
+            param.map(|_| blended)
         } else {
-            tensor
+            param
         }
     }
 }

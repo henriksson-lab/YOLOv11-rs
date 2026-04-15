@@ -107,5 +107,5 @@ pub fn box_iou<B: Backend>(box1: &Tensor<B, 2>, box2: &Tensor<B, 2>) -> Tensor<B
 
     let union = area1 + area2 - inter.clone() + 1e-7;
     let iou = inter / union;
-    iou.squeeze::<2>(2) // [N, M]
+    iou.squeeze::<2>() // [N, M]
 }

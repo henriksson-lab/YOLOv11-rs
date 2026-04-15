@@ -36,7 +36,7 @@ impl<B: Backend> DFL<B> {
         let x = softmax(x, 1);
         let weight = self.weight.clone().reshape([1, ch, 1, 1]);
         let x = x * weight;
-        x.sum_dim(1).squeeze::<3>(1)
+        x.sum_dim(1).squeeze::<3>()
     }
 }
 

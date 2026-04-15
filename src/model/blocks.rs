@@ -152,7 +152,7 @@ impl<B: Backend> SPP<B> {
         let p = k / 2;
         let pool = MaxPool2dConfig::new([k, k])
             .with_strides([1, 1])
-            .with_padding(burn::nn::PaddingConfig2d::Explicit(p, p))
+            .with_padding(burn::nn::PaddingConfig2d::Explicit(p, p, p, p))
             .init();
         Self { conv1, conv2, pool }
     }

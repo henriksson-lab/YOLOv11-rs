@@ -27,7 +27,7 @@ pub fn apply_act<B: Backend>(act: Activation, x: Tensor<B, 4>) -> Tensor<B, 4> {
 #[derive(Module, Debug)]
 pub struct ConvBn<B: Backend> {
     pub conv: Conv2d<B>,
-    pub norm: Option<BatchNorm<B, 2>>,
+    pub norm: Option<BatchNorm<B>>,
 }
 
 impl<B: Backend> ConvBn<B> {
@@ -42,7 +42,7 @@ impl<B: Backend> ConvBn<B> {
     ) -> Self {
         let conv = Conv2dConfig::new([in_ch, out_ch], [k, k])
             .with_stride([s, s])
-            .with_padding(burn::nn::PaddingConfig2d::Explicit(p, p))
+            .with_padding(burn::nn::PaddingConfig2d::Explicit(p, p, p, p))
             .with_groups(g)
             .with_bias(false)
             .init(device);
@@ -58,7 +58,7 @@ impl<B: Backend> ConvBn<B> {
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
         let x = self.conv.forward(x);
         if let Some(ref norm) = self.norm {
-            norm.forward(x)
+            norm.forward::<4>(x)
         } else {
             x
         }

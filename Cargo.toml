@@ -5,11 +5,11 @@ edition = "2021"
 
 [features]
 default = []
-cuda = ["burn/cuda-jit"]
+cuda = ["burn/cuda"]
 
 [dependencies]
-burn = { version = "0.16.1", features = ["train", "wgpu"] }
-burn-import = { version = "0.16", features = ["pytorch"] }
+burn = { version = "0.21.0-pre.3", features = ["train", "wgpu"] }
+burn-store = { version = "0.21.0-pre.3", default-features = false, features = ["std", "safetensors"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

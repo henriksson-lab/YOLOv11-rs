@@ -111,7 +111,7 @@ pub fn batch_nms<B: Backend>(
     let mut results = Vec::with_capacity(batch);
 
     for b in 0..batch {
-        let img_out = output.clone().narrow(0, b, 1).squeeze::<2>(0); // [stride, A]
+        let img_out = output.clone().narrow(0, b, 1).squeeze::<2>(); // [stride, A]
         let img_out = img_out.swap_dims(0, 1); // [A, stride]
         let data: Vec<f32> = img_out.to_data().to_vec().unwrap();
         results.push(non_max_suppression(

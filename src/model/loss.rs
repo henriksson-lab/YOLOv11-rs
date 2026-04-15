@@ -59,8 +59,8 @@ pub fn compute_ciou<B: Backend>(pred: &Tensor<B, 2>, target: &Tensor<B, 2>) -> (
     // DIoU
     let diou = iou.clone() - d2 / (c2 + 1e-7);
 
-    let iou_flat = iou.squeeze::<1>(1);
-    let diou_flat = diou.squeeze::<1>(1);
+    let iou_flat = iou.squeeze::<1>();
+    let diou_flat = diou.squeeze::<1>();
     (diou_flat, iou_flat)
 }
 
@@ -111,7 +111,7 @@ pub fn df_loss<B: Backend>(
     }
 
     let loss = Tensor::<B, 1>::from_floats(loss_vals.as_slice(), device).reshape([n, 4]);
-    loss.mean_dim(1).squeeze::<1>(1) // [N]
+    loss.mean_dim(1).squeeze::<1>() // [N]
 }
 
 // ---------------------------------------------------------------------------
@@ -365,7 +365,7 @@ impl ComputeLoss {
             return (zero.clone(), zero.clone(), zero);
         }
 
-        let target_cls_vec: Vec<f32> = target_cls.clone().squeeze::<1>(1).to_data().to_vec().unwrap();
+        let target_cls_vec: Vec<f32> = target_cls.clone().squeeze::<1>().to_data().to_vec().unwrap();
         let target_box_data: Vec<f32> = target_box_pixel.to_data().to_vec().unwrap();
         let num_targets = target_idx_vec.len();
         let target_box_vec: Vec<[f32; 4]> = (0..num_targets)
@@ -396,8 +396,8 @@ impl ComputeLoss {
             }
 
             // Extract per-image predictions
-            let pb = pred_bboxes.clone().narrow(0, b, 1).squeeze::<2>(0); // [A, 4]
-            let ps = pred_scores_t.clone().narrow(0, b, 1).squeeze::<2>(0); // [A, nc]
+            let pb = pred_bboxes.clone().narrow(0, b, 1).squeeze::<2>(); // [A, 4]
+            let ps = pred_scores_t.clone().narrow(0, b, 1).squeeze::<2>(); // [A, nc]
             let ps_sigmoid = sigmoid(ps.clone());
 
             let ps_data: Vec<f32> = ps_sigmoid.to_data().to_vec().unwrap();
@@ -427,7 +427,7 @@ impl ComputeLoss {
 
             if fg_count == 0 {
                 let cls_target = Tensor::<B, 2>::zeros([total_a, self.nc], device);
-                let cls_loss = bce_with_logits(&ps, &cls_target).sum_dim(1).sum_dim(0).squeeze(0);
+                let cls_loss = bce_with_logits(&ps, &cls_target).sum_dim(1).sum_dim(0).squeeze();
                 total_cls_loss = total_cls_loss + cls_loss;
                 continue;
             }
@@ -444,7 +444,7 @@ impl ComputeLoss {
             }
             let cls_target = Tensor::<B, 1>::from_floats(cls_target_data.as_slice(), device)
                 .reshape([total_a, self.nc]);
-            let cls_loss = bce_with_logits(&ps, &cls_target).sum_dim(1).sum_dim(0).squeeze(0);
+            let cls_loss = bce_with_logits(&ps, &cls_target).sum_dim(1).sum_dim(0).squeeze();
             total_cls_loss = total_cls_loss + cls_loss;
 
             // Box loss (CIoU) on foreground
@@ -475,7 +475,7 @@ impl ComputeLoss {
             total_box_loss = total_box_loss + box_loss;
 
             // DFL loss on foreground
-            let pred_dist_b = pred_dist.clone().narrow(0, b, 1).squeeze::<2>(0); // [4*ch, A]
+            let pred_dist_b = pred_dist.clone().narrow(0, b, 1).squeeze::<2>(); // [4*ch, A]
             let pred_dist_b = pred_dist_b.swap_dims(0, 1); // [A, 4*ch]
             let fg_pred_dist = pred_dist_b.select(0, fg_idx_tensor.clone());
 
@@ -532,7 +532,7 @@ impl ComputeLoss {
         let bins: Vec<f32> = (0..self.ch).map(|i| i as f32).collect();
         let bins = Tensor::<B, 1>::from_floats(bins.as_slice(), device).reshape([1, 1, 1, self.ch]);
         let pd = pd * bins; // [B, 4, A, ch] * [1, 1, 1, ch]
-        let pd = pd.sum_dim(3).squeeze::<3>(3); // [B, 4, A]
+        let pd = pd.sum_dim(3).squeeze::<3>(); // [B, 4, A]
         let pd = pd.swap_dims(1, 2); // [B, A, 4]
 
         // Split into lt, rb
