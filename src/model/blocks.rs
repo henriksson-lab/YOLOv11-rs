@@ -2,7 +2,7 @@ use burn::module::Module;
 use burn::nn::pool::{MaxPool2d, MaxPool2dConfig};
 use burn::prelude::*;
 
-use crate::model::conv::ConvBn;
+use crate::model::conv::{Activation, Conv, FuseModule};
 
 // ---------------------------------------------------------------------------
 // Residual
@@ -10,22 +10,31 @@ use crate::model::conv::ConvBn;
 
 #[derive(Module, Debug)]
 pub struct Residual<B: Backend> {
-    conv1: ConvBn<B>,
-    conv2: ConvBn<B>,
+    conv1: Conv<B>,
+    conv2: Conv<B>,
 }
 
 impl<B: Backend> Residual<B> {
     pub fn new(ch: usize, e: f64, device: &B::Device) -> Self {
         let hid = (ch as f64 * e) as usize;
-        let conv1 = ConvBn::new(ch, hid, 3, 1, 1, 1, device);
-        let conv2 = ConvBn::new(hid, ch, 3, 1, 1, 1, device);
+        let conv1 = Conv::new(ch, hid, Activation::SiLU, 3, 1, 1, 1, device);
+        let conv2 = Conv::new(hid, ch, Activation::SiLU, 3, 1, 1, 1, device);
         Self { conv1, conv2 }
     }
 
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        let y = self.conv1.forward_silu(x.clone());
-        let y = self.conv2.forward_silu(y);
+        let y = self.conv1.forward(x.clone());
+        let y = self.conv2.forward(y);
         x + y
+    }
+}
+
+impl<B: Backend> FuseModule for Residual<B> {
+    fn fuse_module(self) -> Self {
+        Self {
+            conv1: self.conv1.fuse_module(),
+            conv2: self.conv2.fuse_module(),
+        }
     }
 }
 
@@ -35,18 +44,18 @@ impl<B: Backend> Residual<B> {
 
 #[derive(Module, Debug)]
 pub struct CSPModule<B: Backend> {
-    conv1: ConvBn<B>,
-    conv2: ConvBn<B>,
-    conv3: ConvBn<B>,
+    conv1: Conv<B>,
+    conv2: Conv<B>,
+    conv3: Conv<B>,
     res_m: Vec<Residual<B>>,
 }
 
 impl<B: Backend> CSPModule<B> {
     pub fn new(in_ch: usize, out_ch: usize, device: &B::Device) -> Self {
         let half = out_ch / 2;
-        let conv1 = ConvBn::new(in_ch, half, 1, 1, 0, 1, device);
-        let conv2 = ConvBn::new(in_ch, half, 1, 1, 0, 1, device);
-        let conv3 = ConvBn::new(2 * half, out_ch, 1, 1, 0, 1, device);
+        let conv1 = Conv::new(in_ch, half, Activation::SiLU, 1, 1, 0, 1, device);
+        let conv2 = Conv::new(in_ch, half, Activation::SiLU, 1, 1, 0, 1, device);
+        let conv3 = Conv::new(2 * half, out_ch, Activation::SiLU, 1, 1, 0, 1, device);
         let r0 = Residual::new(half, 1.0, device);
         let r1 = Residual::new(half, 1.0, device);
         Self {
@@ -58,13 +67,28 @@ impl<B: Backend> CSPModule<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        let mut y = self.conv1.forward_silu(x.clone());
+        let mut y = self.conv1.forward(x.clone());
         for r in &self.res_m {
             y = r.forward(y);
         }
-        let z = self.conv2.forward_silu(x);
+        let z = self.conv2.forward(x);
         let cat = Tensor::cat(vec![y, z], 1);
-        self.conv3.forward_silu(cat)
+        self.conv3.forward(cat)
+    }
+}
+
+impl<B: Backend> FuseModule for CSPModule<B> {
+    fn fuse_module(self) -> Self {
+        Self {
+            conv1: self.conv1.fuse_module(),
+            conv2: self.conv2.fuse_module(),
+            conv3: self.conv3.fuse_module(),
+            res_m: self
+                .res_m
+                .into_iter()
+                .map(FuseModule::fuse_module)
+                .collect(),
+        }
     }
 }
 
@@ -74,8 +98,8 @@ impl<B: Backend> CSPModule<B> {
 
 #[derive(Module, Debug)]
 pub struct CSP<B: Backend> {
-    conv1: ConvBn<B>,
-    conv2: ConvBn<B>,
+    conv1: Conv<B>,
+    conv2: Conv<B>,
     res_blocks: Vec<Residual<B>>,
     csp_blocks: Vec<CSPModule<B>>,
 }
@@ -92,9 +116,9 @@ impl<B: Backend> CSP<B> {
         device: &B::Device,
     ) -> Self {
         let mid = out_ch / r;
-        let conv1 = ConvBn::new(in_ch, 2 * mid, 1, 1, 0, 1, device);
+        let conv1 = Conv::new(in_ch, 2 * mid, Activation::SiLU, 1, 1, 0, 1, device);
         let cat_ch = (2 + n) * mid;
-        let conv2 = ConvBn::new(cat_ch, out_ch, 1, 1, 0, 1, device);
+        let conv2 = Conv::new(cat_ch, out_ch, Activation::SiLU, 1, 1, 0, 1, device);
 
         let mut res_blocks = Vec::new();
         let mut csp_blocks = Vec::new();
@@ -106,11 +130,16 @@ impl<B: Backend> CSP<B> {
             }
         }
 
-        Self { conv1, conv2, res_blocks, csp_blocks }
+        Self {
+            conv1,
+            conv2,
+            res_blocks,
+            csp_blocks,
+        }
     }
 
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        let c1 = self.conv1.forward_silu(x);
+        let c1 = self.conv1.forward(x);
         let [_b, c, _h, _w] = c1.dims();
         let half = c / 2;
         let first = c1.clone().narrow(1, 0, half);
@@ -130,7 +159,26 @@ impl<B: Backend> CSP<B> {
         }
 
         let cat = Tensor::cat(parts, 1);
-        self.conv2.forward_silu(cat)
+        self.conv2.forward(cat)
+    }
+}
+
+impl<B: Backend> FuseModule for CSP<B> {
+    fn fuse_module(self) -> Self {
+        Self {
+            conv1: self.conv1.fuse_module(),
+            conv2: self.conv2.fuse_module(),
+            res_blocks: self
+                .res_blocks
+                .into_iter()
+                .map(FuseModule::fuse_module)
+                .collect(),
+            csp_blocks: self
+                .csp_blocks
+                .into_iter()
+                .map(FuseModule::fuse_module)
+                .collect(),
+        }
     }
 }
 
@@ -140,15 +188,15 @@ impl<B: Backend> CSP<B> {
 
 #[derive(Module, Debug)]
 pub struct SPP<B: Backend> {
-    conv1: ConvBn<B>,
-    conv2: ConvBn<B>,
+    conv1: Conv<B>,
+    conv2: Conv<B>,
     pool: MaxPool2d,
 }
 
 impl<B: Backend> SPP<B> {
     pub fn new(in_ch: usize, out_ch: usize, k: usize, device: &B::Device) -> Self {
-        let conv1 = ConvBn::new(in_ch, in_ch / 2, 1, 1, 0, 1, device);
-        let conv2 = ConvBn::new(in_ch * 2, out_ch, 1, 1, 0, 1, device);
+        let conv1 = Conv::new(in_ch, in_ch / 2, Activation::SiLU, 1, 1, 0, 1, device);
+        let conv2 = Conv::new(in_ch * 2, out_ch, Activation::SiLU, 1, 1, 0, 1, device);
         let p = k / 2;
         let pool = MaxPool2dConfig::new([k, k])
             .with_strides([1, 1])
@@ -158,11 +206,21 @@ impl<B: Backend> SPP<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        let x = self.conv1.forward_silu(x);
+        let x = self.conv1.forward(x);
         let y1 = self.pool.forward(x.clone());
         let y2 = self.pool.forward(y1.clone());
         let y3 = self.pool.forward(y2.clone());
         let cat = Tensor::cat(vec![x, y1, y2, y3], 1);
-        self.conv2.forward_silu(cat)
+        self.conv2.forward(cat)
+    }
+}
+
+impl<B: Backend> FuseModule for SPP<B> {
+    fn fuse_module(self) -> Self {
+        Self {
+            conv1: self.conv1.fuse_module(),
+            conv2: self.conv2.fuse_module(),
+            pool: self.pool,
+        }
     }
 }

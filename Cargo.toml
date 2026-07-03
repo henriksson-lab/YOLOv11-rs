@@ -8,13 +8,14 @@ default = []
 cuda = ["burn/cuda"]
 
 [dependencies]
-burn = { version = "0.21.0-pre.3", features = ["train", "wgpu"] }
+burn = { version = "0.21.0-pre.3", features = ["train", "wgpu", "ndarray"] }
 burn-store = { version = "0.21.0-pre.3", default-features = false, features = ["std", "safetensors"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 image = "0.25"
 rand = "0.8"
+rand_distr = "0.4"
 bincode = "1"
 rayon = "1"
 clap = { version = "4", features = ["derive"] }

@@ -83,7 +83,58 @@ impl<B: Backend, M: Module<B>> EMA<B, M> {
     }
 
     /// Get a reference to the EMA model for evaluation.
-    pub fn model(&self) -> &M {
+    pub(crate) fn model(&self) -> &M {
         &self.shadow
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EMA;
+    use burn::backend::NdArray;
+    use burn::module::{Module, Param};
+    use burn::prelude::*;
+
+    type TestBackend = NdArray;
+
+    #[derive(Module, Debug)]
+    struct TinyModule<B: Backend> {
+        weight: Param<Tensor<B, 1>>,
+    }
+
+    impl<B: Backend> TinyModule<B> {
+        fn new(value: f32, device: &B::Device) -> Self {
+            Self {
+                weight: Param::from_tensor(Tensor::from_floats([value], device)),
+            }
+        }
+
+        fn with_weight(mut self, value: f32, device: &B::Device) -> Self {
+            self.weight = self.weight.map(|_| Tensor::from_floats([value], device));
+            self
+        }
+
+        fn weight_value(&self) -> f32 {
+            self.weight.val().to_data().to_vec::<f32>().unwrap()[0]
+        }
+    }
+
+    #[test]
+    fn ema_update_matches_python_decay_ramp_fixture() {
+        let device = Default::default();
+        let model = TinyModule::<TestBackend>::new(2.0, &device);
+        let mut ema = EMA::new(&model, 0.9, 2.0);
+
+        let model_after_first_update = model.clone().with_weight(10.0, &device);
+        ema.update(&model_after_first_update, &device);
+        let d1 = 0.9 * (1.0 - (-1.0f64 / 2.0).exp());
+        let expected_first = 2.0 * d1 as f32 + 10.0 * (1.0 - d1 as f32);
+        assert!((ema.model().weight_value() - expected_first).abs() < 1e-6);
+
+        let model_after_second_update = model_after_first_update.with_weight(-4.0, &device);
+        ema.update(&model_after_second_update, &device);
+        let d2 = 0.9 * (1.0 - (-2.0f64 / 2.0).exp());
+        let expected_second = expected_first * d2 as f32 + -4.0 * (1.0 - d2 as f32);
+        assert!((ema.model().weight_value() - expected_second).abs() < 1e-6);
     }
 }

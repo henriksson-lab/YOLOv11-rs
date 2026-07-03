@@ -1,10 +1,11 @@
 use burn::module::Module;
+use burn::module::Param;
 use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::prelude::*;
 use burn::tensor::activation::{sigmoid, softmax};
 
 use crate::model::anchors::make_anchors;
-use crate::model::conv::ConvBn;
+use crate::model::conv::{Activation, Conv, FuseModule};
 
 // ---------------------------------------------------------------------------
 // DFL  (Distribution Focal Loss decoder)
@@ -23,41 +24,17 @@ impl<B: Backend> DFL<B> {
         Self { weight }
     }
 
-    pub fn ch(&self) -> usize {
-        self.weight.dims()[1]
-    }
-
     /// Input: [B, 4*ch, A].  Output: [B, 4, A].
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let [b, _c, a] = x.dims();
-        let ch = self.ch();
+        let ch = self.weight.dims()[1];
         let x = x.reshape([b, 4, ch, a]);
         let x = x.swap_dims(1, 2);
         let x = softmax(x, 1);
         let weight = self.weight.clone().reshape([1, ch, 1, 1]);
         let x = x * weight;
-        x.sum_dim(1).squeeze::<3>()
+        x.sum_dim(1).reshape([b, 4, a])
     }
-}
-
-// ---------------------------------------------------------------------------
-// Box and Cls head branches
-// ---------------------------------------------------------------------------
-
-#[derive(Module, Debug)]
-pub struct BoxBranch<B: Backend> {
-    c0: ConvBn<B>,
-    c1: ConvBn<B>,
-    c2: Conv2d<B>,
-}
-
-#[derive(Module, Debug)]
-pub struct ClsBranch<B: Backend> {
-    c0: ConvBn<B>,
-    c1: ConvBn<B>,
-    c2: ConvBn<B>,
-    c3: ConvBn<B>,
-    c4: Conv2d<B>,
 }
 
 // ---------------------------------------------------------------------------
@@ -66,19 +43,29 @@ pub struct ClsBranch<B: Backend> {
 
 #[derive(Module, Debug)]
 pub struct Head<B: Backend> {
-    pub stride: Tensor<B, 1>,
+    nc: usize,
+    nl: usize,
+    ch: usize,
+    stride: Tensor<B, 1>,
     dfl: DFL<B>,
-    box_branches: Vec<BoxBranch<B>>,
-    cls_branches: Vec<ClsBranch<B>>,
+    box_c0: Vec<Conv<B>>,
+    box_c1: Vec<Conv<B>>,
+    box_c2: Vec<Conv2d<B>>,
+    cls_c0: Vec<Conv<B>>,
+    cls_c1: Vec<Conv<B>>,
+    cls_c2: Vec<Conv<B>>,
+    cls_c3: Vec<Conv<B>>,
+    cls_c4: Vec<Conv2d<B>>,
+}
+
+#[derive(Debug)]
+pub enum HeadOutput<B: Backend> {
+    Train(Vec<Tensor<B, 4>>),
+    Infer(Tensor<B, 3>),
 }
 
 impl<B: Backend> Head<B> {
-    pub fn new(
-        nc: usize,
-        filters: &[usize],
-        stride: Tensor<B, 1>,
-        device: &B::Device,
-    ) -> Self {
+    pub fn new(nc: usize, filters: &[usize], stride: Tensor<B, 1>, device: &B::Device) -> Self {
         let ch: usize = 16;
         let nl = filters.len();
         let dfl = DFL::new(ch, device);
@@ -86,84 +73,119 @@ impl<B: Backend> Head<B> {
         let box_hidden = 64.max(filters[0] / 4);
         let cls_hidden = 80.max(filters[0]).max(nc);
 
-        let mut box_branches = Vec::with_capacity(nl);
-        let mut cls_branches = Vec::with_capacity(nl);
+        let mut box_c0 = Vec::with_capacity(nl);
+        let mut box_c1 = Vec::with_capacity(nl);
+        let mut box_c2 = Vec::with_capacity(nl);
+        let mut cls_c0 = Vec::with_capacity(nl);
+        let mut cls_c1 = Vec::with_capacity(nl);
+        let mut cls_c2 = Vec::with_capacity(nl);
+        let mut cls_c3 = Vec::with_capacity(nl);
+        let mut cls_c4 = Vec::with_capacity(nl);
 
         for &f in filters {
-            let b0 = ConvBn::new(f, box_hidden, 3, 1, 1, 1, device);
-            let b1 = ConvBn::new(box_hidden, box_hidden, 3, 1, 1, 1, device);
-            let b2 = Conv2dConfig::new([box_hidden, 4 * ch], [1, 1]).init(device);
-            box_branches.push(BoxBranch { c0: b0, c1: b1, c2: b2 });
+            box_c0.push(Conv::new(
+                f,
+                box_hidden,
+                Activation::SiLU,
+                3,
+                1,
+                1,
+                1,
+                device,
+            ));
+            box_c1.push(Conv::new(
+                box_hidden,
+                box_hidden,
+                Activation::SiLU,
+                3,
+                1,
+                1,
+                1,
+                device,
+            ));
+            box_c2.push(Conv2dConfig::new([box_hidden, 4 * ch], [1, 1]).init(device));
 
-            let c0 = ConvBn::new(f, f, 3, 1, 1, f, device);
-            let c1 = ConvBn::new(f, cls_hidden, 1, 1, 0, 1, device);
-            let c2 = ConvBn::new(cls_hidden, cls_hidden, 3, 1, 1, cls_hidden, device);
-            let c3 = ConvBn::new(cls_hidden, cls_hidden, 1, 1, 0, 1, device);
-            let c4 = Conv2dConfig::new([cls_hidden, nc], [1, 1]).init(device);
-            cls_branches.push(ClsBranch { c0, c1, c2, c3, c4 });
+            cls_c0.push(Conv::new(f, f, Activation::SiLU, 3, 1, 1, f, device));
+            cls_c1.push(Conv::new(
+                f,
+                cls_hidden,
+                Activation::SiLU,
+                1,
+                1,
+                0,
+                1,
+                device,
+            ));
+            cls_c2.push(Conv::new(
+                cls_hidden,
+                cls_hidden,
+                Activation::SiLU,
+                3,
+                1,
+                1,
+                cls_hidden,
+                device,
+            ));
+            cls_c3.push(Conv::new(
+                cls_hidden,
+                cls_hidden,
+                Activation::SiLU,
+                1,
+                1,
+                0,
+                1,
+                device,
+            ));
+            cls_c4.push(Conv2dConfig::new([cls_hidden, nc], [1, 1]).init(device));
         }
 
         Self {
+            nc,
+            nl,
+            ch,
             stride,
             dfl,
-            box_branches,
-            cls_branches,
+            box_c0,
+            box_c1,
+            box_c2,
+            cls_c0,
+            cls_c1,
+            cls_c2,
+            cls_c3,
+            cls_c4,
         }
     }
 
-    pub fn nc(&self) -> usize {
-        if let Some(cb) = self.cls_branches.first() {
-            // nc is the output channels of the last conv
-            // We can infer from c4's weight shape
-            let w = cb.c4.weight.val();
-            w.dims()[0]
-        } else {
-            0
-        }
-    }
-
-    pub fn nl(&self) -> usize {
-        self.box_branches.len()
-    }
-
-    pub fn ch(&self) -> usize {
-        self.dfl.ch()
-    }
-
-    /// Returns list of per-scale outputs (for training).
-    pub fn forward_train(&self, xs: &[Tensor<B, 4>]) -> Vec<Tensor<B, 4>> {
-        let mut outputs = Vec::with_capacity(self.nl());
+    pub fn forward(&self, xs: &[Tensor<B, 4>], training: bool) -> HeadOutput<B> {
+        let mut outputs = Vec::with_capacity(self.nl);
         for (i, x) in xs.iter().enumerate() {
-            let bb = &self.box_branches[i];
-            let box_out = bb.c0.forward_silu(x.clone());
-            let box_out = bb.c1.forward_silu(box_out);
-            let box_out = bb.c2.forward(box_out);
+            let box_out = self.box_c0[i].forward(x.clone());
+            let box_out = self.box_c1[i].forward(box_out);
+            let box_out = self.box_c2[i].forward(box_out);
 
-            let cb = &self.cls_branches[i];
-            let cls_out = cb.c0.forward_silu(x.clone());
-            let cls_out = cb.c1.forward_silu(cls_out);
-            let cls_out = cb.c2.forward_silu(cls_out);
-            let cls_out = cb.c3.forward_silu(cls_out);
-            let cls_out = cb.c4.forward(cls_out);
+            let cls_out = self.cls_c0[i].forward(x.clone());
+            let cls_out = self.cls_c1[i].forward(cls_out);
+            let cls_out = self.cls_c2[i].forward(cls_out);
+            let cls_out = self.cls_c3[i].forward(cls_out);
+            let cls_out = self.cls_c4[i].forward(cls_out);
 
             let cat = Tensor::cat(vec![box_out, cls_out], 1);
             outputs.push(cat);
         }
-        outputs
-    }
 
-    /// Returns decoded [B, 4+nc, total_anchors] tensor (for inference).
-    pub fn forward_infer(&self, xs: &[Tensor<B, 4>]) -> Tensor<B, 3> {
-        let outputs = self.forward_train(xs);
-        let nc = self.nc();
-        let ch = self.ch();
+        if training {
+            return HeadOutput::Train(outputs);
+        }
+
+        let nc = self.nc;
+        let ch = self.ch;
         let no = nc + ch * 4;
 
         let device = outputs[0].device();
         let (anchors, strides) = make_anchors::<B>(&outputs, &self.stride, 0.5, &device);
         let anchors = anchors.swap_dims(0, 1); // [2, total]
         let strides = strides.swap_dims(0, 1); // [1, total]
-        // Add batch dim for broadcasting
+                                               // Add batch dim for broadcasting
         let anchors: Tensor<B, 3> = anchors.unsqueeze_dim(0); // [1, 2, total]
         let strides: Tensor<B, 3> = strides.unsqueeze_dim(0); // [1, 1, total]
 
@@ -191,6 +213,164 @@ impl<B: Backend> Head<B> {
         let box_scaled = box_decoded * strides;
 
         let cls_sigmoid = sigmoid(cls_raw);
-        Tensor::cat(vec![box_scaled, cls_sigmoid], 1)
+        HeadOutput::Infer(Tensor::cat(vec![box_scaled, cls_sigmoid], 1))
+    }
+
+    pub fn initialize_biases(&mut self) {
+        let nc = self.nc;
+        let ch = self.ch;
+        let stride_values: Vec<f32> = self.stride.clone().to_data().to_vec().unwrap();
+
+        for i in 0..self.nl {
+            let device = self.box_c2[i].weight.val().device();
+            self.box_c2[i].bias = Some(Param::from_tensor(Tensor::<B, 1>::full(
+                [4 * ch],
+                1.0,
+                &device,
+            )));
+
+            let s = stride_values[i] as f64;
+            let cls_bias = (5.0 / nc as f64 / (640.0 / s).powi(2)).ln() as f32;
+            self.cls_c4[i].bias = Some(Param::from_tensor(Tensor::<B, 1>::full(
+                [nc],
+                cls_bias,
+                &device,
+            )));
+        }
+    }
+}
+
+impl<B: Backend> FuseModule for Head<B> {
+    fn fuse_module(self) -> Self {
+        Self {
+            nc: self.nc,
+            nl: self.nl,
+            ch: self.ch,
+            stride: self.stride,
+            dfl: self.dfl,
+            box_c0: self
+                .box_c0
+                .into_iter()
+                .map(FuseModule::fuse_module)
+                .collect(),
+            box_c1: self
+                .box_c1
+                .into_iter()
+                .map(FuseModule::fuse_module)
+                .collect(),
+            box_c2: self.box_c2,
+            cls_c0: self
+                .cls_c0
+                .into_iter()
+                .map(FuseModule::fuse_module)
+                .collect(),
+            cls_c1: self
+                .cls_c1
+                .into_iter()
+                .map(FuseModule::fuse_module)
+                .collect(),
+            cls_c2: self
+                .cls_c2
+                .into_iter()
+                .map(FuseModule::fuse_module)
+                .collect(),
+            cls_c3: self
+                .cls_c3
+                .into_iter()
+                .map(FuseModule::fuse_module)
+                .collect(),
+            cls_c4: self.cls_c4,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Head, HeadOutput, DFL};
+    use burn::backend::NdArray;
+    use burn::prelude::*;
+
+    type TestBackend = NdArray;
+
+    #[test]
+    fn dfl_forward_matches_python_projection_fixture() {
+        let device = Default::default();
+        let dfl = DFL::<TestBackend>::new(4, &device);
+        let x = Tensor::<TestBackend, 1>::from_floats(
+            [
+                0.2, 0.3, -0.1, 0.1, 0.4, -0.2, 1.0, 0.5, 1.2, 0.7, 0.3, -0.4, -0.7, 0.2, 0.0, 0.0,
+                -0.5, -0.1, 0.8, 0.2, 0.1, 0.4, -1.0, -0.8, 0.0, 1.0, 0.0, 0.0, 0.0, -0.5, 0.0,
+                0.2,
+            ],
+            &device,
+        )
+        .reshape([1, 16, 2]);
+
+        let out = dfl.forward(x).to_data().to_vec::<f32>().unwrap();
+        let expected = [
+            1.9006745, 1.5619756, 0.86645204, 1.2461841, 1.286728, 1.3652573, 1.5, 1.0596901,
+        ];
+
+        for (actual, expected) in out.iter().zip(expected) {
+            assert!((*actual - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn initialize_biases_sets_python_head_bias_values() {
+        let device = Default::default();
+        let stride = Tensor::<TestBackend, 1>::from_floats([8.0, 16.0, 32.0], &device);
+        let mut head = Head::<TestBackend>::new(3, &[16, 32, 64], stride, &device);
+
+        head.initialize_biases();
+
+        let box_bias = head.box_c2[0]
+            .bias
+            .as_ref()
+            .unwrap()
+            .val()
+            .to_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert!(box_bias.iter().all(|v| (*v - 1.0).abs() < 1e-6));
+
+        let cls_bias = head.cls_c4[0]
+            .bias
+            .as_ref()
+            .unwrap()
+            .val()
+            .to_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let expected = (5.0f32 / 3.0 / (640.0f32 / 8.0).powi(2)).ln();
+        assert!(cls_bias.iter().all(|v| (*v - expected).abs() < 1e-6));
+    }
+
+    #[test]
+    fn head_forward_training_and_inference_shapes_match_python_layout() {
+        let device = Default::default();
+        let stride = Tensor::<TestBackend, 1>::from_floats([8.0, 16.0, 32.0], &device);
+        let mut head = Head::<TestBackend>::new(2, &[8, 16, 32], stride, &device);
+        head.initialize_biases();
+        let xs = vec![
+            Tensor::<TestBackend, 4>::zeros([1, 8, 4, 4], &device),
+            Tensor::<TestBackend, 4>::zeros([1, 16, 2, 2], &device),
+            Tensor::<TestBackend, 4>::zeros([1, 32, 1, 1], &device),
+        ];
+
+        match head.forward(&xs, true) {
+            HeadOutput::Train(outputs) => {
+                assert_eq!(outputs.len(), 3);
+                assert_eq!(outputs[0].dims(), [1, 66, 4, 4]);
+                assert_eq!(outputs[1].dims(), [1, 66, 2, 2]);
+                assert_eq!(outputs[2].dims(), [1, 66, 1, 1]);
+            }
+            HeadOutput::Infer(_) => panic!("training forward returned inference output"),
+        }
+
+        match head.forward(&xs, false) {
+            HeadOutput::Infer(output) => assert_eq!(output.dims(), [1, 6, 21]),
+            HeadOutput::Train(_) => panic!("inference forward returned training output"),
+        }
     }
 }

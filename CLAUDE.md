@@ -6,13 +6,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 YOLOv11 object detection with two implementations:
 - **`YOLOv11-pt/`** â€” Original Python/PyTorch reference implementation
-- **`src/`** â€” Rust port using the Candle ML framework (single crate, binary with `train`/`test` subcommands)
+- **`src/`** â€” Rust port using the Burn ML framework (single crate, binary with `train`/`test`/`profile` subcommands)
+
+## Translation Rule
+
+The Rust code is intended to be a faithful translation of `YOLOv11-pt/`. Original Python top-level functions, classes, and class methods should map 1:1 to Rust functions, structs, and methods with systematic snake_case names. Do not add public translated-layer helpers or renamed convenience APIs unless they correspond to an original Python item. Rust-only framework/CLI glue belongs outside the translated model/data/util surface or must be explicitly documented as glue.
+
+Use `python3 tools/translation_conformance.py` after translation-surface changes. The check must report no missing mapped Rust items and no extra public translated-layer Rust items.
 
 ## Building (Rust)
 
 ```bash
-cargo build --release              # Wgpu backend (default)
-cargo build --release --features cuda  # With candle-cuda via Burn
+cargo build --release                  # WGPU backend (default)
+cargo build --release --features cuda  # CUDA backend via Burn
 ```
 
 ## Commands (Rust)
@@ -21,17 +27,15 @@ cargo build --release --features cuda  # With candle-cuda via Burn
 # Train
 cargo run --release -- train --config default_args.yaml --data-dir /path/to/COCO
 
-# Evaluate (with Burn-native weights)
+# Evaluate with Burn-native weights
 cargo run --release -- test --config default_args.yaml --data-dir /path/to/COCO --weights weights/best
 
-# Load converted .pt weights (see conversion step below)
-cargo run --release -- test --config default_args.yaml --data-dir /path/to/COCO --weights weights/model.pt
-
-# Convert PyTorch .pt weights to Burn-compatible key names
-python convert_weights.py YOLOv11-pt/weights/best.pt -o weights/model.pt
+# Profile
+cargo run --release -- profile --config default_args.yaml --input-size 640
 ```
 
 Key flags: `--input-size` (default 640), `--batch-size` (default 32), `--epochs` (default 600).
+Direct `.pt`/`.pth` loading is not supported by the current Burn 0.21 pre-release path; use Burn record or `.safetensors` weights.
 
 ## Commands (Python)
 
@@ -59,11 +63,11 @@ Model variants (n/t/s/m/l/x) differ only in `width`, `depth`, and `csp` arrays â
 
 ### Key Rust implementation details
 
-- **BatchNorm2d** is implemented from scratch in `src/model/conv.rs` (not provided by candle-nn). Uses `RefCell` for running stats with `forward(x, training)` to switch behavior.
+- **Conv** wraps Burn `Conv2d` + `BatchNorm` + activation and supports private recursive fuse glue.
 - **Task-aligned assigner** in `src/model/loss.rs` runs on CPU using pure Rust `Vec` operations (no gradient needed).
-- **NMS** in `src/model/nms.rs` is greedy CPU-side implementation.
-- Training vs inference mode is explicit via `training: bool` parameter on forward methods.
-- Checkpoints saved as `.safetensors`; Python `.pt` weights loaded via `VarBuilder::from_pth`.
+- **NMS** in `src/model/nms.rs` is greedy CPU-side implementation that returns Python-shaped `Nx6` rows.
+- Training vs inference mode is explicit via `training: bool` parameters and Rust enum return glue.
+- Checkpoints are Burn records or `.safetensors`; Python `.pt`/`.pth` loading is explicitly unsupported in the current CLI.
 
 ### Training (`src/train/`)
 
@@ -71,8 +75,8 @@ Model variants (n/t/s/m/l/x) differ only in `width`, `depth`, and `csp` arrays â
 - Gradient accumulation (effective batch size 64)
 - EMA of model weights
 - Mosaic augmentation disabled for last 10 epochs
-- Logs to `weights/step.csv`; saves `weights/best.safetensors` and `weights/last.safetensors`
-- Single GPU only (no DDP equivalent in Candle)
+- Logs to `weights/step.csv`; saves Burn records under `weights/best` and `weights/last`
+- Single-device training only (no DDP equivalent in this Burn translation)
 
 ### Dataset (`src/data/`)
 
@@ -84,4 +88,4 @@ Model variants (n/t/s/m/l/x) differ only in `width`, `depth`, and `csp` arrays â
 
 - `default_args.yaml` â€” example config with all training hyperparameters and COCO class names (same format as `YOLOv11-pt/utils/args.yaml`)
 - `--config` is required, no default path
-- Model variant is selected by changing the `yolo_v11_n` call in `src/main.rs` and `src/train/train.rs`
+- Training, evaluation, and profiling instantiate `yolo_v11_n`, matching the original Python entrypoints.

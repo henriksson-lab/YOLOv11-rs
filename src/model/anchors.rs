@@ -61,51 +61,50 @@ pub fn wh2xy<B: Backend>(x: &Tensor<B, 2>) -> Tensor<B, 2> {
     Tensor::cat(vec![x1, y1, x2, y2], 1)
 }
 
-/// Convert boxes from [x1, y1, x2, y2] to [cx, cy, w, h].
-pub fn xy2wh<B: Backend>(x: &Tensor<B, 2>) -> Tensor<B, 2> {
-    let x1 = x.clone().narrow(1, 0, 1);
-    let y1 = x.clone().narrow(1, 1, 1);
-    let x2 = x.clone().narrow(1, 2, 1);
-    let y2 = x.clone().narrow(1, 3, 1);
-    let cx = (x1.clone() + x2.clone()) * 0.5;
-    let cy = (y1.clone() + y2.clone()) * 0.5;
-    let w = x2 - x1;
-    let h = y2 - y1;
-    Tensor::cat(vec![cx, cy, w, h], 1)
-}
+#[cfg(test)]
+mod tests {
+    use super::{make_anchors, wh2xy};
+    use burn::backend::NdArray;
+    use burn::prelude::*;
 
-/// Compute IoU between two sets of boxes in [x1, y1, x2, y2] format.
-/// box1: [N, 4], box2: [M, 4]. Returns [N, M].
-pub fn box_iou<B: Backend>(box1: &Tensor<B, 2>, box2: &Tensor<B, 2>) -> Tensor<B, 2> {
-    // Expand for broadcasting: box1 [N, 1, 4], box2 [1, M, 4]
-    let b1: Tensor<B, 3> = box1.clone().unsqueeze_dim(1); // [N, 1, 4]
-    let b2: Tensor<B, 3> = box2.clone().unsqueeze_dim(0); // [1, M, 4]
+    type TestBackend = NdArray;
 
-    let b1_x1 = b1.clone().narrow(2, 0, 1);
-    let b1_y1 = b1.clone().narrow(2, 1, 1);
-    let b1_x2 = b1.clone().narrow(2, 2, 1);
-    let b1_y2 = b1.narrow(2, 3, 1);
+    #[test]
+    fn make_anchors_matches_python_grid_order_and_shapes() {
+        let device = Default::default();
+        let x0 = Tensor::<TestBackend, 4>::zeros([1, 8, 2, 3], &device);
+        let x1 = Tensor::<TestBackend, 4>::zeros([1, 8, 1, 2], &device);
+        let strides = Tensor::<TestBackend, 1>::from_floats([8.0, 16.0], &device);
 
-    let b2_x1 = b2.clone().narrow(2, 0, 1);
-    let b2_y1 = b2.clone().narrow(2, 1, 1);
-    let b2_x2 = b2.clone().narrow(2, 2, 1);
-    let b2_y2 = b2.narrow(2, 3, 1);
+        let (anchors, stride_tensor) = make_anchors(&[x0, x1], &strides, 0.5, &device);
 
-    // Intersection
-    let inter_x1 = b1_x1.clone().max_pair(b2_x1.clone());
-    let inter_y1 = b1_y1.clone().max_pair(b2_y1.clone());
-    let inter_x2 = b1_x2.clone().min_pair(b2_x2.clone());
-    let inter_y2 = b1_y2.clone().min_pair(b2_y2.clone());
+        assert_eq!(anchors.dims(), [8, 2]);
+        assert_eq!(stride_tensor.dims(), [8, 1]);
+        assert_eq!(
+            anchors.to_data().to_vec::<f32>().unwrap(),
+            vec![0.5, 0.5, 1.5, 0.5, 2.5, 0.5, 0.5, 1.5, 1.5, 1.5, 2.5, 1.5, 0.5, 0.5, 1.5, 0.5,]
+        );
+        assert_eq!(
+            stride_tensor.to_data().to_vec::<f32>().unwrap(),
+            vec![8.0, 8.0, 8.0, 8.0, 8.0, 8.0, 16.0, 16.0]
+        );
+    }
 
-    let inter_w = (inter_x2 - inter_x1).clamp_min(0.0);
-    let inter_h = (inter_y2 - inter_y1).clamp_min(0.0);
-    let inter = inter_w * inter_h; // [N, M, 1]
+    #[test]
+    fn wh2xy_matches_python_edge_fixture() {
+        let device = Default::default();
+        let boxes = Tensor::<TestBackend, 1>::from_floats(
+            [
+                10.0, 12.0, 4.0, 6.0, -2.0, 3.0, 8.0, 10.0, 0.0, 0.0, 0.0, 2.0,
+            ],
+            &device,
+        )
+        .reshape([3, 4]);
 
-    // Areas
-    let area1 = (b1_x2 - b1_x1) * (b1_y2 - b1_y1); // [N, 1, 1]
-    let area2 = (b2_x2 - b2_x1) * (b2_y2 - b2_y1); // [1, M, 1]
-
-    let union = area1 + area2 - inter.clone() + 1e-7;
-    let iou = inter / union;
-    iou.squeeze::<2>() // [N, M]
+        let xy = wh2xy(&boxes);
+        assert_eq!(
+            xy.to_data().to_vec::<f32>().unwrap(),
+            vec![8.0, 9.0, 12.0, 15.0, -6.0, -2.0, 2.0, 8.0, 0.0, -1.0, 0.0, 1.0]
+        );
+    }
 }
