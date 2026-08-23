@@ -10,7 +10,7 @@ pub enum Activation {
     Identity,
 }
 
-pub fn fuse_conv<B: Backend>(conv: Conv2d<B>, norm: BatchNorm<B>) -> Conv2d<B> {
+pub fn fuse_conv(conv: Conv2d, norm: BatchNorm) -> Conv2d {
     let device = conv.weight.val().device();
     let [out_ch, _in_ch, _k1, _k2] = conv.weight.dims();
 
@@ -22,7 +22,7 @@ pub fn fuse_conv<B: Backend>(conv: Conv2d<B>, norm: BatchNorm<B>) -> Conv2d<B> {
 
     let conv_bias = match conv.bias.as_ref() {
         Some(bias) => bias.val(),
-        None => Tensor::<B, 1>::zeros([out_ch], &device),
+        None => Tensor::<1>::zeros([out_ch], &device),
     };
 
     let fused_weight = conv.weight.val() * scale.clone().reshape([out_ch, 1, 1, 1]);
@@ -43,9 +43,10 @@ pub fn fuse_conv<B: Backend>(conv: Conv2d<B>, norm: BatchNorm<B>) -> Conv2d<B> {
 }
 
 #[derive(Module, Debug)]
-pub struct Conv<B: Backend> {
-    conv: Conv2d<B>,
-    norm: Option<BatchNorm<B>>,
+pub struct Conv {
+    conv: Conv2d,
+    norm: Option<BatchNorm>,
+    #[module(skip)]
     relu: Activation,
 }
 
@@ -53,7 +54,7 @@ pub(crate) trait FuseModule {
     fn fuse_module(self) -> Self;
 }
 
-impl<B: Backend> Conv<B> {
+impl Conv {
     pub fn new(
         in_ch: usize,
         out_ch: usize,
@@ -62,7 +63,7 @@ impl<B: Backend> Conv<B> {
         s: usize,
         p: usize,
         g: usize,
-        device: &B::Device,
+        device: &Device,
     ) -> Self {
         let conv = Conv2dConfig::new([in_ch, out_ch], [k, k])
             .with_stride([s, s])
@@ -83,7 +84,7 @@ impl<B: Backend> Conv<B> {
         }
     }
 
-    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+    pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
         let x = self.conv.forward(x);
         let x = if let Some(ref norm) = self.norm {
             norm.forward::<4>(x)
@@ -96,7 +97,7 @@ impl<B: Backend> Conv<B> {
         }
     }
 
-    pub fn fuse_forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+    pub fn fuse_forward(&self, x: Tensor<4>) -> Tensor<4> {
         let x = self.conv.forward(x);
         match self.relu {
             Activation::SiLU => burn::tensor::activation::silu(x),
@@ -105,7 +106,7 @@ impl<B: Backend> Conv<B> {
     }
 }
 
-impl<B: Backend> FuseModule for Conv<B> {
+impl FuseModule for Conv {
     fn fuse_module(self) -> Self {
         let Self { conv, norm, relu } = self;
         match norm {
@@ -122,47 +123,44 @@ impl<B: Backend> FuseModule for Conv<B> {
 #[cfg(test)]
 mod tests {
     use super::fuse_conv;
-    use burn::backend::NdArray;
     use burn::module::{Param, RunningState};
     use burn::nn::conv::Conv2dConfig;
     use burn::nn::BatchNormConfig;
     use burn::nn::PaddingConfig2d;
     use burn::prelude::*;
 
-    type TestBackend = NdArray;
-
     #[test]
     fn fuse_conv_matches_python_weight_and_bias_formula() {
-        let device = Default::default();
+        let device = burn::tensor::Device::flex();
         let mut conv = Conv2dConfig::new([1, 2], [1, 1])
             .with_padding(PaddingConfig2d::Explicit(0, 0, 0, 0))
             .with_bias(false)
-            .init::<TestBackend>(&device);
+            .init(&device);
         conv.weight = Param::from_tensor(
-            Tensor::<TestBackend, 1>::from_floats([2.0, -3.0], &device).reshape([2, 1, 1, 1]),
+            Tensor::<1>::from_floats([2.0, -3.0], &device).reshape([2, 1, 1, 1]),
         );
 
         let mut norm = BatchNormConfig::new(2)
             .with_epsilon(0.001)
-            .init::<TestBackend>(&device);
+            .init(&device);
         norm.gamma =
-            Param::from_tensor(Tensor::<TestBackend, 1>::from_floats([1.5, -2.0], &device));
+            Param::from_tensor(Tensor::<1>::from_floats([1.5, -2.0], &device));
         norm.beta =
-            Param::from_tensor(Tensor::<TestBackend, 1>::from_floats([0.25, 0.75], &device));
+            Param::from_tensor(Tensor::<1>::from_floats([0.25, 0.75], &device));
         norm.running_mean =
-            RunningState::new(Tensor::<TestBackend, 1>::from_floats([0.5, -1.0], &device));
+            RunningState::new(Tensor::<1>::from_floats([0.5, -1.0], &device));
         norm.running_var =
-            RunningState::new(Tensor::<TestBackend, 1>::from_floats([4.0, 0.25], &device));
+            RunningState::new(Tensor::<1>::from_floats([4.0, 0.25], &device));
 
         let fused = fuse_conv(conv, norm);
-        let weight = fused.weight.val().to_data().to_vec::<f32>().unwrap();
+        let weight = fused.weight.val().to_data().try_to_vec::<f32>().unwrap();
         let bias = fused
             .bias
             .as_ref()
             .unwrap()
             .val()
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         let scale0 = 1.5_f32 / (4.0_f32 + 0.001).sqrt();

@@ -9,10 +9,7 @@ use crate::model::anchors;
 
 /// Compute CIoU between pred [N, 4] and target [N, 4] boxes in xyxy format.
 /// Returns (ciou, iou) both [N].
-pub fn compute_iou<B: Backend>(
-    pred: &Tensor<B, 2>,
-    target: &Tensor<B, 2>,
-) -> (Tensor<B, 1>, Tensor<B, 1>) {
+pub fn compute_iou(pred: &Tensor<2>, target: &Tensor<2>) -> (Tensor<1>, Tensor<1>) {
     let p_x1 = pred.clone().narrow(1, 0, 1);
     let p_y1 = pred.clone().narrow(1, 1, 1);
     let p_x2 = pred.clone().narrow(1, 2, 1);
@@ -252,17 +249,17 @@ impl BoxLoss {
         Self { dfl_ch }
     }
 
-    pub fn forward<B: Backend>(
+    pub fn forward(
         &self,
-        pred_dist: &Tensor<B, 2>,
-        pred_bboxes: &Tensor<B, 2>,
-        anchor_points: &Tensor<B, 2>,
-        target_bboxes: &Tensor<B, 2>,
-        target_scores: &Tensor<B, 2>,
+        pred_dist: &Tensor<2>,
+        pred_bboxes: &Tensor<2>,
+        anchor_points: &Tensor<2>,
+        target_bboxes: &Tensor<2>,
+        target_scores: &Tensor<2>,
         target_scores_sum: f32,
         fg_mask: &[bool],
-        device: &B::Device,
-    ) -> (Tensor<B, 1>, Tensor<B, 1>) {
+        device: &Device,
+    ) -> (Tensor<1>, Tensor<1>) {
         let fg_indices: Vec<usize> = fg_mask
             .iter()
             .enumerate()
@@ -271,12 +268,12 @@ impl BoxLoss {
             .collect();
 
         if fg_indices.is_empty() {
-            let zero = Tensor::<B, 1>::zeros([1], device);
+            let zero = Tensor::<1>::zeros([1], device);
             return (zero.clone(), zero);
         }
 
         let fg_count = fg_indices.len();
-        let fg_idx_tensor = Tensor::<B, 1, Int>::from_ints(
+        let fg_idx_tensor = Tensor::<1, Int>::from_ints(
             fg_indices
                 .iter()
                 .map(|&i| i as i32)
@@ -316,17 +313,17 @@ impl BoxLoss {
         (loss_box, loss_dfl)
     }
 
-    pub fn df_loss<B: Backend>(
-        pred_dist: &Tensor<B, 2>,
-        target: &Tensor<B, 2>,
+    pub fn df_loss(
+        pred_dist: &Tensor<2>,
+        target: &Tensor<2>,
         ch: usize,
-        device: &B::Device,
-    ) -> Tensor<B, 1> {
+        device: &Device,
+    ) -> Tensor<1> {
         let target_flat: Vec<f32> = target
             .clone()
             .reshape([target.dims()[0] * 4])
             .to_data()
-            .to_vec()
+            .try_to_vec::<f32>()
             .unwrap();
         let n = pred_dist.dims()[0];
 
@@ -341,7 +338,7 @@ impl BoxLoss {
 
         let pd = pred_dist.clone().reshape([n * 4, ch]);
         let log_sm = log_softmax(pd, 1);
-        let log_sm_data: Vec<f32> = log_sm.to_data().to_vec().unwrap();
+        let log_sm_data: Vec<f32> = log_sm.to_data().try_to_vec::<f32>().unwrap();
 
         let mut loss_vals = Vec::with_capacity(n * 4);
         for i in 0..n * 4 {
@@ -351,7 +348,7 @@ impl BoxLoss {
             loss_vals.push(ll + lr);
         }
 
-        let loss = Tensor::<B, 1>::from_floats(loss_vals.as_slice(), device).reshape([n, 4]);
+        let loss = Tensor::<1>::from_floats(loss_vals.as_slice(), device).reshape([n, 4]);
         loss.mean_dim(1).reshape([n])
     }
 }
@@ -365,11 +362,7 @@ impl QFL {
         Self { beta }
     }
 
-    pub fn forward<B: Backend>(
-        &self,
-        outputs: &Tensor<B, 2>,
-        targets: &Tensor<B, 2>,
-    ) -> Tensor<B, 2> {
+    pub fn forward(&self, outputs: &Tensor<2>, targets: &Tensor<2>) -> Tensor<2> {
         let bce_loss = outputs.clone().clamp_min(0.0) - outputs.clone() * targets.clone()
             + (outputs.clone().abs().neg().exp() + 1.0).log();
         (targets.clone() - sigmoid(outputs.clone()))
@@ -394,11 +387,7 @@ impl VFL {
         }
     }
 
-    pub fn forward<B: Backend>(
-        &self,
-        outputs: &Tensor<B, 2>,
-        targets: &Tensor<B, 2>,
-    ) -> Tensor<B, 2> {
+    pub fn forward(&self, outputs: &Tensor<2>, targets: &Tensor<2>) -> Tensor<2> {
         let loss = outputs.clone().clamp_min(0.0) - outputs.clone() * targets.clone()
             + (outputs.clone().abs().neg().exp() + 1.0).log();
         let distance = (sigmoid(outputs.clone()) - targets.clone())
@@ -428,11 +417,7 @@ impl FocalLoss {
         Self { alpha, gamma }
     }
 
-    pub fn forward<B: Backend>(
-        &self,
-        outputs: &Tensor<B, 2>,
-        targets: &Tensor<B, 2>,
-    ) -> Tensor<B, 2> {
+    pub fn forward(&self, outputs: &Tensor<2>, targets: &Tensor<2>) -> Tensor<2> {
         let mut loss = outputs.clone().clamp_min(0.0) - outputs.clone() * targets.clone()
             + (outputs.clone().abs().neg().exp() + 1.0).log();
         if self.alpha > 0.0 {
@@ -442,7 +427,7 @@ impl FocalLoss {
         }
         if self.gamma > 0.0 {
             let outputs_sigmoid = sigmoid(outputs.clone());
-            let p_t: Tensor<B, 2> = targets.clone() * outputs_sigmoid.clone()
+            let p_t: Tensor<2> = targets.clone() * outputs_sigmoid.clone()
                 + (targets.clone().neg() + 1.0) * (outputs_sigmoid.neg() + 1.0);
             loss = loss * (p_t.neg() + 1.0).powf_scalar(self.gamma);
         }
@@ -465,15 +450,15 @@ pub struct ComputeLoss {
 }
 
 impl ComputeLoss {
-    pub fn new<B: Backend>(
+    pub fn new(
         nc: usize,
         nl: usize,
-        stride: &Tensor<B, 1>,
+        stride: &Tensor<1>,
         box_gain: f64,
         cls_gain: f64,
         dfl_gain: f64,
     ) -> Self {
-        let stride_vec: Vec<f32> = stride.to_data().to_vec().unwrap();
+        let stride_vec: Vec<f32> = stride.to_data().try_to_vec::<f32>().unwrap();
         Self {
             nc,
             ch: 16,
@@ -485,20 +470,20 @@ impl ComputeLoss {
         }
     }
 
-    pub fn call<B: Backend>(
+    pub fn call(
         &self,
-        outputs: &[Tensor<B, 4>],
-        target_cls: &Tensor<B, 2>, // [num_targets, 1]
-        target_box: &Tensor<B, 2>, // [num_targets, 4]  normalized xywh
-        target_idx: &Tensor<B, 1>, // [num_targets]  batch index
+        outputs: &[Tensor<4>],
+        target_cls: &Tensor<2>, // [num_targets, 1]
+        target_box: &Tensor<2>, // [num_targets, 4]  normalized xywh
+        target_idx: &Tensor<1>, // [num_targets]  batch index
         batch_size: usize,
         img_size: usize,
-        device: &B::Device,
-    ) -> (Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>) {
+        device: &Device,
+    ) -> (Tensor<1>, Tensor<1>, Tensor<1>) {
         let no = self.nc + self.ch * 4;
 
         // Flatten outputs: [B, no, total_A]
-        let mut flat: Vec<Tensor<B, 3>> = Vec::new();
+        let mut flat: Vec<Tensor<3>> = Vec::new();
         for o in outputs {
             let [b, _, h, w] = o.dims();
             flat.push(o.clone().reshape([b, no, h * w]));
@@ -510,14 +495,14 @@ impl ComputeLoss {
         let pred_scores = x.narrow(1, box_ch, self.nc); // [B, nc, A]
 
         // Generate anchors
-        let stride_t = Tensor::<B, 1>::from_floats(self.stride.as_slice(), device);
+        let stride_t = Tensor::<1>::from_floats(self.stride.as_slice(), device);
         let (anchor_points, strides) =
-            crate::model::anchors::make_anchors::<B>(outputs, &stride_t, 0.5, device);
+            crate::model::anchors::make_anchors(outputs, &stride_t, 0.5, device);
 
         let total_a = anchor_points.dims()[0];
 
         // Decode predicted boxes in anchor units, matching Python's box_decode.
-        let pred_bboxes = self.box_decode::<B>(&pred_dist, &anchor_points, &strides, device);
+        let pred_bboxes = self.box_decode(&pred_dist, &anchor_points, &strides, device);
 
         let pred_scores_t = pred_scores.swap_dims(1, 2); // [B, A, nc]
 
@@ -525,19 +510,19 @@ impl ComputeLoss {
         let target_box_xyxy = anchors::wh2xy(target_box);
         let target_box_pixel = target_box_xyxy * (img_size as f32);
 
-        let mut total_box_loss = Tensor::<B, 1>::zeros([1], device);
-        let mut total_cls_loss = Tensor::<B, 1>::zeros([1], device);
-        let mut total_dfl_loss = Tensor::<B, 1>::zeros([1], device);
+        let mut total_box_loss = Tensor::<1>::zeros([1], device);
+        let mut total_cls_loss = Tensor::<1>::zeros([1], device);
+        let mut total_dfl_loss = Tensor::<1>::zeros([1], device);
 
-        let target_idx_vec: Vec<f32> = target_idx.to_data().to_vec().unwrap();
+        let target_idx_vec: Vec<f32> = target_idx.to_data().try_to_vec::<f32>().unwrap();
 
         let target_cls_vec: Vec<f32> = target_cls
             .clone()
             .squeeze_dim::<1>(1)
             .to_data()
-            .to_vec()
+            .try_to_vec::<f32>()
             .unwrap();
-        let target_box_data: Vec<f32> = target_box_pixel.to_data().to_vec().unwrap();
+        let target_box_data: Vec<f32> = target_box_pixel.to_data().try_to_vec::<f32>().unwrap();
         let valid_target_indices: Vec<usize> = target_idx_vec
             .iter()
             .enumerate()
@@ -564,7 +549,16 @@ impl ComputeLoss {
             })
             .collect();
 
-        let anc_data: Vec<f32> = anchor_points.to_data().to_vec().unwrap();
+        // The assigner works in pixels: `gt_bboxes` are pixels and `pd_bboxes`
+        // are multiplied by their stride below, so the anchor points must be
+        // too. `make_anchors` returns them in grid units — 0..40 at stride 8 on
+        // a 320 px image — and comparing those against pixel boxes makes
+        // `is_inside` true only near the origin, so almost nothing is ever
+        // assigned and the model learns to predict nothing. Python does the
+        // same multiplication (`anchor_points * stride_tensor`) at the same
+        // point.
+        let anchor_points_pixel = anchor_points.clone() * strides.clone();
+        let anc_data: Vec<f32> = anchor_points_pixel.to_data().try_to_vec::<f32>().unwrap();
         let anc_vec: Vec<[f32; 2]> = (0..total_a)
             .map(|i| [anc_data[i * 2], anc_data[i * 2 + 1]])
             .collect();
@@ -587,7 +581,7 @@ impl ComputeLoss {
             let ps = pred_scores_t.clone().narrow(0, b, 1).squeeze_dim::<2>(0); // [A, nc]
             let ps_sigmoid = sigmoid(ps.clone());
 
-            let ps_data: Vec<f32> = ps_sigmoid.to_data().to_vec().unwrap();
+            let ps_data: Vec<f32> = ps_sigmoid.to_data().try_to_vec::<f32>().unwrap();
             let ps_vec: Vec<Vec<f32>> = (0..total_a)
                 .map(|i| {
                     let start = i * self.nc;
@@ -596,7 +590,7 @@ impl ComputeLoss {
                 .collect();
 
             let pb_pixel = pb.clone() * strides.clone();
-            let pb_data: Vec<f32> = pb_pixel.to_data().to_vec().unwrap();
+            let pb_data: Vec<f32> = pb_pixel.to_data().try_to_vec::<f32>().unwrap();
             let pb_vec: Vec<[f32; 4]> = (0..total_a)
                 .map(|i| {
                     [
@@ -623,7 +617,7 @@ impl ComputeLoss {
             let fg_count: usize = fg_mask.iter().filter(|&&v| v).count();
 
             let cls_target_data: Vec<f32> = target_scores.iter().flatten().copied().collect();
-            let cls_target = Tensor::<B, 1>::from_floats(cls_target_data.as_slice(), device)
+            let cls_target = Tensor::<1>::from_floats(cls_target_data.as_slice(), device)
                 .reshape([total_a, self.nc]);
             let cls_loss = (ps.clone().clamp_min(0.0) - ps.clone() * cls_target.clone()
                 + (ps.clone().abs().neg().exp() + 1.0).log())
@@ -639,7 +633,7 @@ impl ComputeLoss {
 
             let pred_dist_b = pred_dist.clone().narrow(0, b, 1).squeeze_dim::<2>(0); // [4*ch, A]
             let pred_dist_b = pred_dist_b.swap_dims(0, 1); // [A, 4*ch]
-            let strides_data: Vec<f32> = strides.to_data().to_vec().unwrap();
+            let strides_data: Vec<f32> = strides.to_data().try_to_vec::<f32>().unwrap();
 
             let target_bboxes_data: Vec<f32> = (0..total_a)
                 .flat_map(|a| {
@@ -653,7 +647,7 @@ impl ComputeLoss {
                 })
                 .collect();
             let target_bboxes_tensor =
-                Tensor::<B, 1>::from_floats(target_bboxes_data.as_slice(), device)
+                Tensor::<1>::from_floats(target_bboxes_data.as_slice(), device)
                     .reshape([total_a, 4]);
 
             let (box_loss, dfl_loss) = BoxLoss::new(self.ch - 1).forward(
@@ -678,20 +672,20 @@ impl ComputeLoss {
     }
 
     /// Decode DFL distribution to box coordinates.
-    pub fn box_decode<B: Backend>(
+    pub fn box_decode(
         &self,
-        pred_dist: &Tensor<B, 3>,
-        anchor_points: &Tensor<B, 2>,
-        _strides: &Tensor<B, 2>,
-        device: &B::Device,
-    ) -> Tensor<B, 3> {
+        pred_dist: &Tensor<3>,
+        anchor_points: &Tensor<2>,
+        _strides: &Tensor<2>,
+        device: &Device,
+    ) -> Tensor<3> {
         let [b, _, a] = pred_dist.dims();
 
         let pd = pred_dist.clone().reshape([b, 4, self.ch, a]);
         let pd = pd.swap_dims(2, 3); // [B, 4, A, ch]
         let pd = burn::tensor::activation::softmax(pd, 3);
         let bins: Vec<f32> = (0..self.ch).map(|i| i as f32).collect();
-        let bins = Tensor::<B, 1>::from_floats(bins.as_slice(), device).reshape([1, 1, 1, self.ch]);
+        let bins = Tensor::<1>::from_floats(bins.as_slice(), device).reshape([1, 1, 1, self.ch]);
         let pd = pd * bins; // [B, 4, A, ch] * [1, 1, 1, ch]
         let pd = pd.sum_dim(3).squeeze_dim::<3>(3); // [B, 4, A]
         let pd = pd.swap_dims(1, 2); // [B, A, 4]
@@ -710,10 +704,7 @@ impl ComputeLoss {
 #[cfg(test)]
 mod tests {
     use super::{compute_iou, ComputeLoss};
-    use burn::backend::NdArray;
     use burn::prelude::*;
-
-    type TestBackend = NdArray;
 
     fn ciou_scalar(box1: [f32; 4], box2: [f32; 4]) -> (f32, f32) {
         let eps = 1e-7f32;
@@ -742,15 +733,15 @@ mod tests {
 
     #[test]
     fn compute_iou_matches_python_ciou_formula() {
-        let device = Default::default();
+        let device = burn::tensor::Device::flex();
         let pred =
-            Tensor::<TestBackend, 1>::from_floats([0.0, 0.0, 2.0, 3.0], &device).reshape([1, 4]);
+            Tensor::<1>::from_floats([0.0, 0.0, 2.0, 3.0], &device).reshape([1, 4]);
         let target =
-            Tensor::<TestBackend, 1>::from_floats([0.5, 0.25, 2.5, 2.0], &device).reshape([1, 4]);
+            Tensor::<1>::from_floats([0.5, 0.25, 2.5, 2.0], &device).reshape([1, 4]);
 
         let (ciou, iou) = compute_iou(&pred, &target);
-        let ciou = ciou.to_data().to_vec::<f32>().unwrap()[0];
-        let iou = iou.to_data().to_vec::<f32>().unwrap()[0];
+        let ciou = ciou.to_data().try_to_vec::<f32>().unwrap()[0];
+        let iou = iou.to_data().try_to_vec::<f32>().unwrap()[0];
         let (expected_ciou, expected_iou) =
             ciou_scalar([0.0, 0.0, 2.0, 3.0], [0.5, 0.25, 2.5, 2.0]);
 
@@ -878,13 +869,13 @@ mod tests {
 
     #[test]
     fn vfl_matches_python_positive_negative_weighting() {
-        let device = Default::default();
+        let device = burn::tensor::Device::flex();
         let outputs =
-            Tensor::<TestBackend, 1>::from_floats([0.0, 0.0, 0.0], &device).reshape([1, 3]);
+            Tensor::<1>::from_floats([0.0, 0.0, 0.0], &device).reshape([1, 3]);
         let targets =
-            Tensor::<TestBackend, 1>::from_floats([1.0, 0.0, 0.4], &device).reshape([1, 3]);
+            Tensor::<1>::from_floats([1.0, 0.0, 0.4], &device).reshape([1, 3]);
         let loss = super::VFL::new(0.75, 2.0, true).forward(&outputs, &targets);
-        let loss = loss.to_data().to_vec::<f32>().unwrap();
+        let loss = loss.to_data().try_to_vec::<f32>().unwrap();
 
         let bce = std::f32::consts::LN_2;
         let expected = [bce, bce * 0.75 * 0.5f32.powi(2), bce * 0.4];
@@ -895,28 +886,28 @@ mod tests {
 
     #[test]
     fn qfl_and_focal_loss_match_python_fixture() {
-        let device = Default::default();
+        let device = burn::tensor::Device::flex();
         let outputs =
-            Tensor::<TestBackend, 1>::from_floats([-2.0, 0.0, 1.5, 3.0, -1.0, 0.25], &device)
+            Tensor::<1>::from_floats([-2.0, 0.0, 1.5, 3.0, -1.0, 0.25], &device)
                 .reshape([2, 3]);
         let targets =
-            Tensor::<TestBackend, 1>::from_floats([0.0, 1.0, 0.4, 1.0, 0.0, 0.75], &device)
+            Tensor::<1>::from_floats([0.0, 1.0, 0.4, 1.0, 0.0, 0.75], &device)
                 .reshape([2, 3]);
 
         let qfl = super::QFL::new(2.0)
             .forward(&outputs, &targets)
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let focal = super::FocalLoss::new(0.25, 1.5)
             .forward(&outputs, &targets)
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let bce = super::FocalLoss::new(0.0, 0.0)
             .forward(&outputs, &targets)
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         let expected_qfl = [
@@ -957,8 +948,8 @@ mod tests {
 
     #[test]
     fn box_loss_df_loss_matches_python_fixture() {
-        let device = Default::default();
-        let pred_dist = Tensor::<TestBackend, 1>::from_floats(
+        let device = burn::tensor::Device::flex();
+        let pred_dist = Tensor::<1>::from_floats(
             [
                 0.2, -0.1, 0.4, 1.0, 1.2, 0.3, -0.7, 0.0, -0.5, 0.8, 0.1, -1.0, 0.0, 0.0, 0.0, 0.0,
                 0.3, 0.1, -0.2, 0.5, 0.7, -0.4, 0.2, 0.0, -0.1, 0.2, 0.4, -0.8, 1.0, 0.0, -0.5,
@@ -967,7 +958,7 @@ mod tests {
             &device,
         )
         .reshape([2, 16]);
-        let target = Tensor::<TestBackend, 1>::from_floats(
+        let target = Tensor::<1>::from_floats(
             [0.2, 1.7, 2.4, 2.99, 0.0, 0.5, 1.2, 2.8],
             &device,
         )
@@ -975,7 +966,7 @@ mod tests {
 
         let loss = super::BoxLoss::df_loss(&pred_dist, &target, 4, &device)
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let expected = [1.7778859, 1.3875707];
 
@@ -987,17 +978,17 @@ mod tests {
     #[test]
     #[should_panic]
     fn box_loss_df_loss_out_of_range_target_matches_python_index_error() {
-        let device = Default::default();
-        let pred_dist = Tensor::<TestBackend, 1>::from_floats([0.0; 4], &device).reshape([1, 4]);
+        let device = burn::tensor::Device::flex();
+        let pred_dist = Tensor::<1>::from_floats([0.0; 4], &device).reshape([1, 4]);
         let target =
-            Tensor::<TestBackend, 1>::from_floats([3.0, 0.0, 0.0, 0.0], &device).reshape([1, 4]);
+            Tensor::<1>::from_floats([3.0, 0.0, 0.0, 0.0], &device).reshape([1, 4]);
 
         let _ = super::BoxLoss::df_loss(&pred_dist, &target, 4, &device);
     }
 
     #[test]
     fn compute_loss_box_decode_matches_python_fixture() {
-        let device = Default::default();
+        let device = burn::tensor::Device::flex();
         let loss = ComputeLoss {
             nc: 1,
             ch: 4,
@@ -1007,7 +998,7 @@ mod tests {
             cls_gain: 0.5,
             dfl_gain: 1.5,
         };
-        let pred_dist = Tensor::<TestBackend, 1>::from_floats(
+        let pred_dist = Tensor::<1>::from_floats(
             [
                 0.2, 0.3, -0.1, 0.1, 0.4, -0.2, 1.0, 0.5, 1.2, 0.7, 0.3, -0.4, -0.7, 0.2, 0.0, 0.0,
                 -0.5, -0.1, 0.8, 0.2, 0.1, 0.4, -1.0, -0.8, 0.0, 1.0, 0.0, 0.0, 0.0, -0.5, 0.0,
@@ -1017,13 +1008,13 @@ mod tests {
         )
         .reshape([1, 16, 2]);
         let anchor_points =
-            Tensor::<TestBackend, 1>::from_floats([2.5, 3.5, 6.0, 1.0], &device).reshape([2, 2]);
-        let strides = Tensor::<TestBackend, 1>::from_floats([8.0, 8.0], &device).reshape([2, 1]);
+            Tensor::<1>::from_floats([2.5, 3.5, 6.0, 1.0], &device).reshape([2, 2]);
+        let strides = Tensor::<1>::from_floats([8.0, 8.0], &device).reshape([2, 1]);
 
         let decoded = loss
             .box_decode(&pred_dist, &anchor_points, &strides, &device)
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let expected = [
             0.59932555, 2.633548, 3.786728, 5.0, 4.4380245, -0.2461841, 7.3652573, 2.0596902,
@@ -1036,23 +1027,23 @@ mod tests {
 
     #[test]
     fn box_loss_forward_returns_weighted_box_and_dfl_losses() {
-        let device = Default::default();
+        let device = burn::tensor::Device::flex();
         let box_loss = super::BoxLoss::new(3);
-        let pred_dist = Tensor::<TestBackend, 1>::from_floats([0.0; 32], &device).reshape([2, 16]);
-        let pred_bboxes = Tensor::<TestBackend, 1>::from_floats(
+        let pred_dist = Tensor::<1>::from_floats([0.0; 32], &device).reshape([2, 16]);
+        let pred_bboxes = Tensor::<1>::from_floats(
             [0.0, 0.0, 2.0, 2.0, 2.0, 2.0, 4.0, 4.0],
             &device,
         )
         .reshape([2, 4]);
         let anchor_points =
-            Tensor::<TestBackend, 1>::from_floats([1.0, 1.0, 3.0, 3.0], &device).reshape([2, 2]);
-        let target_bboxes = Tensor::<TestBackend, 1>::from_floats(
+            Tensor::<1>::from_floats([1.0, 1.0, 3.0, 3.0], &device).reshape([2, 2]);
+        let target_bboxes = Tensor::<1>::from_floats(
             [0.0, 0.0, 2.0, 2.0, 2.0, 2.0, 4.0, 4.0],
             &device,
         )
         .reshape([2, 4]);
         let target_scores =
-            Tensor::<TestBackend, 1>::from_floats([0.5, 0.0], &device).reshape([2, 1]);
+            Tensor::<1>::from_floats([0.5, 0.0], &device).reshape([2, 1]);
 
         let (loss_box, loss_dfl) = box_loss.forward(
             &pred_dist,
@@ -1065,21 +1056,21 @@ mod tests {
             &device,
         );
 
-        let loss_box = loss_box.to_data().to_vec::<f32>().unwrap()[0];
-        let loss_dfl = loss_dfl.to_data().to_vec::<f32>().unwrap()[0];
+        let loss_box = loss_box.to_data().try_to_vec::<f32>().unwrap()[0];
+        let loss_dfl = loss_dfl.to_data().try_to_vec::<f32>().unwrap()[0];
         assert!(loss_box.abs() < 1e-5);
         assert!((loss_dfl - 4.0_f32.ln()).abs() < 1e-6);
     }
 
     #[test]
     fn compute_loss_call_keeps_background_cls_loss_for_empty_targets() {
-        let device = Default::default();
-        let stride = Tensor::<TestBackend, 1>::from_floats([8.0], &device);
-        let loss = ComputeLoss::new::<TestBackend>(1, 1, &stride, 7.5, 0.5, 1.5);
-        let outputs = vec![Tensor::<TestBackend, 1>::zeros([65], &device).reshape([1, 65, 1, 1])];
-        let target_cls = Tensor::<TestBackend, 1>::zeros([1], &device).reshape([1, 1]);
-        let target_box = Tensor::<TestBackend, 1>::zeros([4], &device).reshape([1, 4]);
-        let target_idx = Tensor::<TestBackend, 1>::from_floats([-1.0], &device);
+        let device = burn::tensor::Device::flex();
+        let stride = Tensor::<1>::from_floats([8.0], &device);
+        let loss = ComputeLoss::new(1, 1, &stride, 7.5, 0.5, 1.5);
+        let outputs = vec![Tensor::<1>::zeros([65], &device).reshape([1, 65, 1, 1])];
+        let target_cls = Tensor::<1>::zeros([1], &device).reshape([1, 1]);
+        let target_box = Tensor::<1>::zeros([4], &device).reshape([1, 4]);
+        let target_idx = Tensor::<1>::from_floats([-1.0], &device);
 
         let (loss_box, loss_cls, loss_dfl) = loss.call(
             &outputs,
@@ -1090,9 +1081,9 @@ mod tests {
             8,
             &device,
         );
-        let loss_box = loss_box.to_data().to_vec::<f32>().unwrap()[0];
-        let loss_cls = loss_cls.to_data().to_vec::<f32>().unwrap()[0];
-        let loss_dfl = loss_dfl.to_data().to_vec::<f32>().unwrap()[0];
+        let loss_box = loss_box.to_data().try_to_vec::<f32>().unwrap()[0];
+        let loss_cls = loss_cls.to_data().try_to_vec::<f32>().unwrap()[0];
+        let loss_dfl = loss_dfl.to_data().try_to_vec::<f32>().unwrap()[0];
 
         assert_eq!(loss_box, 0.0);
         assert!((loss_cls - 0.5 * std::f32::consts::LN_2).abs() < 1e-6);
@@ -1101,15 +1092,15 @@ mod tests {
 
     #[test]
     fn compute_loss_call_returns_finite_losses_for_matched_target() {
-        let device = Default::default();
-        let stride = Tensor::<TestBackend, 1>::from_floats([8.0], &device);
-        let loss = ComputeLoss::new::<TestBackend>(1, 1, &stride, 7.5, 0.5, 1.5);
+        let device = burn::tensor::Device::flex();
+        let stride = Tensor::<1>::from_floats([8.0], &device);
+        let loss = ComputeLoss::new(1, 1, &stride, 7.5, 0.5, 1.5);
         let outputs =
-            vec![Tensor::<TestBackend, 1>::zeros([65 * 4 * 4], &device).reshape([1, 65, 4, 4])];
-        let target_cls = Tensor::<TestBackend, 1>::zeros([1], &device).reshape([1, 1]);
+            vec![Tensor::<1>::zeros([65 * 4 * 4], &device).reshape([1, 65, 4, 4])];
+        let target_cls = Tensor::<1>::zeros([1], &device).reshape([1, 1]);
         let target_box =
-            Tensor::<TestBackend, 1>::from_floats([0.5, 0.5, 1.0, 1.0], &device).reshape([1, 4]);
-        let target_idx = Tensor::<TestBackend, 1>::from_floats([0.0], &device);
+            Tensor::<1>::from_floats([0.5, 0.5, 1.0, 1.0], &device).reshape([1, 4]);
+        let target_idx = Tensor::<1>::from_floats([0.0], &device);
 
         let (loss_box, loss_cls, loss_dfl) = loss.call(
             &outputs,
@@ -1121,9 +1112,9 @@ mod tests {
             &device,
         );
         let losses = [
-            loss_box.to_data().to_vec::<f32>().unwrap()[0],
-            loss_cls.to_data().to_vec::<f32>().unwrap()[0],
-            loss_dfl.to_data().to_vec::<f32>().unwrap()[0],
+            loss_box.to_data().try_to_vec::<f32>().unwrap()[0],
+            loss_cls.to_data().try_to_vec::<f32>().unwrap()[0],
+            loss_dfl.to_data().try_to_vec::<f32>().unwrap()[0],
         ];
 
         assert!(losses.iter().all(|loss| loss.is_finite()));
@@ -1131,17 +1122,57 @@ mod tests {
     }
 
     #[test]
+    fn compute_loss_call_assigns_targets_away_from_the_image_origin() {
+        // The assigner compares anchor points against ground-truth boxes, and
+        // both have to be in the same units. `make_anchors` produces grid units
+        // (0..40 at stride 8 on a 320 px image) while the boxes are pixels, so
+        // if the stride multiplication is dropped `is_inside` can only be true
+        // near the origin — and a centred box assigns nothing at all.
+        //
+        // The older tests do not catch this because they use a 32 px image,
+        // where the grid extent and the pixel extent are close enough that
+        // every anchor still lands inside the box either way.
+        let device = burn::tensor::Device::flex();
+        let stride = Tensor::<1>::from_floats([8.0], &device);
+        let loss = ComputeLoss::new(1, 1, &stride, 7.5, 0.5, 1.5);
+
+        // 320 px at stride 8 is a 40 x 40 grid.
+        let outputs = vec![Tensor::<1>::zeros([65 * 40 * 40], &device).reshape([1, 65, 40, 40])];
+        let target_cls = Tensor::<1>::zeros([1], &device).reshape([1, 1]);
+        // Centred, a tenth of the image across: pixels 144..176, nowhere near
+        // the origin.
+        let target_box = Tensor::<1>::from_floats([0.5, 0.5, 0.1, 0.1], &device).reshape([1, 4]);
+        let target_idx = Tensor::<1>::from_floats([0.0], &device);
+
+        let (loss_box, _loss_cls, loss_dfl) =
+            loss.call(&outputs, &target_cls, &target_box, &target_idx, 1, 320, &device);
+
+        // Box and DFL losses are computed only over assigned anchors, so a
+        // non-zero value here is the assertion that anything was assigned.
+        let box_value = loss_box.to_data().try_to_vec::<f32>().unwrap()[0];
+        let dfl_value = loss_dfl.to_data().try_to_vec::<f32>().unwrap()[0];
+        assert!(
+            box_value > 0.0,
+            "no anchor was assigned to a centred box: box loss {box_value}"
+        );
+        assert!(
+            dfl_value > 0.0,
+            "no anchor was assigned to a centred box: dfl loss {dfl_value}"
+        );
+    }
+
+    #[test]
     fn compute_loss_call_uses_python_batch_global_target_score_sum() {
-        let device = Default::default();
-        let stride = Tensor::<TestBackend, 1>::from_floats([8.0], &device);
-        let loss = ComputeLoss::new::<TestBackend>(1, 1, &stride, 1.0, 1.0, 1.0);
+        let device = burn::tensor::Device::flex();
+        let stride = Tensor::<1>::from_floats([8.0], &device);
+        let loss = ComputeLoss::new(1, 1, &stride, 1.0, 1.0, 1.0);
 
         let single_outputs =
-            vec![Tensor::<TestBackend, 1>::zeros([65 * 8 * 8], &device).reshape([1, 65, 8, 8])];
-        let single_cls = Tensor::<TestBackend, 1>::zeros([1], &device).reshape([1, 1]);
+            vec![Tensor::<1>::zeros([65 * 8 * 8], &device).reshape([1, 65, 8, 8])];
+        let single_cls = Tensor::<1>::zeros([1], &device).reshape([1, 1]);
         let single_box =
-            Tensor::<TestBackend, 1>::from_floats([0.5, 0.5, 1.0, 1.0], &device).reshape([1, 4]);
-        let single_idx = Tensor::<TestBackend, 1>::from_floats([0.0], &device);
+            Tensor::<1>::from_floats([0.5, 0.5, 1.0, 1.0], &device).reshape([1, 4]);
+        let single_idx = Tensor::<1>::from_floats([0.0], &device);
         let single_losses = loss.call(
             &single_outputs,
             &single_cls,
@@ -1153,14 +1184,14 @@ mod tests {
         );
 
         let batch_outputs =
-            vec![Tensor::<TestBackend, 1>::zeros([2 * 65 * 8 * 8], &device).reshape([2, 65, 8, 8])];
-        let batch_cls = Tensor::<TestBackend, 1>::zeros([2], &device).reshape([2, 1]);
-        let batch_box = Tensor::<TestBackend, 1>::from_floats(
+            vec![Tensor::<1>::zeros([2 * 65 * 8 * 8], &device).reshape([2, 65, 8, 8])];
+        let batch_cls = Tensor::<1>::zeros([2], &device).reshape([2, 1]);
+        let batch_box = Tensor::<1>::from_floats(
             [0.5, 0.5, 1.0, 1.0, 0.5, 0.5, 1.0, 1.0],
             &device,
         )
         .reshape([2, 4]);
-        let batch_idx = Tensor::<TestBackend, 1>::from_floats([0.0, 1.0], &device);
+        let batch_idx = Tensor::<1>::from_floats([0.0, 1.0], &device);
         let batch_losses = loss.call(
             &batch_outputs,
             &batch_cls,
@@ -1172,14 +1203,14 @@ mod tests {
         );
 
         let single = [
-            single_losses.0.to_data().to_vec::<f32>().unwrap()[0],
-            single_losses.1.to_data().to_vec::<f32>().unwrap()[0],
-            single_losses.2.to_data().to_vec::<f32>().unwrap()[0],
+            single_losses.0.to_data().try_to_vec::<f32>().unwrap()[0],
+            single_losses.1.to_data().try_to_vec::<f32>().unwrap()[0],
+            single_losses.2.to_data().try_to_vec::<f32>().unwrap()[0],
         ];
         let batch = [
-            batch_losses.0.to_data().to_vec::<f32>().unwrap()[0],
-            batch_losses.1.to_data().to_vec::<f32>().unwrap()[0],
-            batch_losses.2.to_data().to_vec::<f32>().unwrap()[0],
+            batch_losses.0.to_data().try_to_vec::<f32>().unwrap()[0],
+            batch_losses.1.to_data().try_to_vec::<f32>().unwrap()[0],
+            batch_losses.2.to_data().try_to_vec::<f32>().unwrap()[0],
         ];
 
         for (single, batch) in single.iter().zip(batch) {

@@ -8,17 +8,17 @@ use crate::model::conv::{Activation, Conv, FuseModule};
 
 /// DarkFPN neck – fuses multi-scale features from backbone.
 #[derive(Module, Debug)]
-pub struct DarkFPN<B: Backend> {
-    h1: CSP<B>,
-    h2: CSP<B>,
-    h3: Conv<B>,
-    h4: CSP<B>,
-    h5: Conv<B>,
-    h6: CSP<B>,
+pub struct DarkFPN {
+    h1: CSP,
+    h2: CSP,
+    h3: Conv,
+    h4: CSP,
+    h5: Conv,
+    h6: CSP,
 }
 
-impl<B: Backend> DarkFPN<B> {
-    pub fn new(width: &[usize], depth: &[usize], csp: &[bool], device: &B::Device) -> Self {
+impl DarkFPN {
+    pub fn new(width: &[usize], depth: &[usize], csp: &[bool], device: &Device) -> Self {
         let h1 = CSP::new(width[4] + width[5], width[4], depth[5], csp[0], 2, device);
         let h2 = CSP::new(width[4] + width[4], width[3], depth[5], csp[0], 2, device);
         let h3 = Conv::new(width[3], width[3], Activation::SiLU, 3, 2, 1, 1, device);
@@ -37,10 +37,10 @@ impl<B: Backend> DarkFPN<B> {
 
     pub fn forward(
         &self,
-        p3: Tensor<B, 4>,
-        p4: Tensor<B, 4>,
-        p5: Tensor<B, 4>,
-    ) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {
+        p3: Tensor<4>,
+        p4: Tensor<4>,
+        p5: Tensor<4>,
+    ) -> (Tensor<4>, Tensor<4>, Tensor<4>) {
         let [_, _, p4h, p4w] = p4.dims();
         let [_, _, p3h, p3w] = p3.dims();
 
@@ -72,7 +72,7 @@ impl<B: Backend> DarkFPN<B> {
     }
 }
 
-impl<B: Backend> FuseModule for DarkFPN<B> {
+impl FuseModule for DarkFPN {
     fn fuse_module(self) -> Self {
         Self {
             h1: self.h1.fuse_module(),

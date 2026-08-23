@@ -1,5 +1,4 @@
 use anyhow::Result;
-use burn::backend::NdArray;
 use burn_store::ModuleSnapshot;
 use std::path::Path;
 use yolov11::data::dataset::Dataset;
@@ -29,8 +28,8 @@ fn main() -> Result<()> {
         val_filenames.truncate(limit);
     }
 
-    let device = Default::default();
-    let model = model::yolo_v11_n::<NdArray>(config.num_classes(), &device);
+    let device = burn::tensor::Device::flex();
+    let model = model::yolo_v11_n(config.num_classes(), &device);
     let mut model = model;
     let mut store = burn_store::SafetensorsStore::from_file("weights/model.safetensors");
     model

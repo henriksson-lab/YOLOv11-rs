@@ -8,8 +8,8 @@ default = []
 cuda = ["burn/cuda"]
 
 [dependencies]
-burn = { version = "0.21.0-pre.3", features = ["train", "wgpu", "ndarray"] }
-burn-store = { version = "0.21.0-pre.3", default-features = false, features = ["std", "safetensors"] }
+burn = { version = "0.22.0-pre.2", features = ["optim", "wgpu", "flex"] }
+burn-store = { version = "0.22.0-pre.2", default-features = false, features = ["std", "safetensors"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
@@ -22,3 +22,9 @@ clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 csv = "1"
 zune-jpeg = "0.5"
+
+[patch.crates-io]
+# Standardised on the fork at /home/mahogny/github/claude/burn, which carries
+# tracel-ai/burn#5400 (the fusion fix); published 0.22.0-pre.2 does not.
+burn = { path = "/home/mahogny/github/claude/burn/crates/burn" }
+burn-store = { path = "/home/mahogny/github/claude/burn/crates/burn-store" }

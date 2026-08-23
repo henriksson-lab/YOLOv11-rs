@@ -3,8 +3,8 @@ use burn::prelude::*;
 use std::time::Instant;
 
 /// Apply NMS to model outputs in Python's `[B, 4 + nc, A]` layout.
-pub fn non_max_suppression<B: Backend>(
-    outputs: &Tensor<B, 3>,
+pub fn non_max_suppression(
+    outputs: &Tensor<3>,
     confidence_threshold: f32,
     iou_threshold: f32,
 ) -> Vec<Vec<[f32; 6]>> {
@@ -23,7 +23,7 @@ pub fn non_max_suppression<B: Backend>(
             .narrow(0, index, 1)
             .squeeze_dim::<2>(0)
             .swap_dims(0, 1);
-        let preds: Vec<f32> = x.to_data().to_vec().unwrap();
+        let preds: Vec<f32> = x.to_data().try_to_vec::<f32>().unwrap();
 
         let mut candidates: Vec<[f32; 6]> = Vec::new();
         for i in 0..num_anchors {
@@ -111,20 +111,17 @@ pub fn non_max_suppression<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::non_max_suppression;
-    use burn::backend::NdArray;
     use burn::prelude::*;
 
-    type TestBackend = NdArray;
-
-    fn outputs(anchor_major: &[f32], stride: usize, num_anchors: usize) -> Tensor<TestBackend, 3> {
-        let device = Default::default();
+    fn outputs(anchor_major: &[f32], stride: usize, num_anchors: usize) -> Tensor<3> {
+        let device = burn::tensor::Device::flex();
         let mut channel_major = Vec::with_capacity(anchor_major.len());
         for c in 0..stride {
             for a in 0..num_anchors {
                 channel_major.push(anchor_major[a * stride + c]);
             }
         }
-        Tensor::<TestBackend, 1>::from_floats(channel_major.as_slice(), &device).reshape([
+        Tensor::<1>::from_floats(channel_major.as_slice(), &device).reshape([
             1,
             stride,
             num_anchors,
@@ -133,8 +130,8 @@ mod tests {
 
     #[test]
     fn non_max_suppression_preserves_python_batch_output_slots() {
-        let device = Default::default();
-        let output = Tensor::<TestBackend, 3>::zeros([3, 5, 0], &device);
+        let device = burn::tensor::Device::flex();
+        let output = Tensor::<3>::zeros([3, 5, 0], &device);
         let detections = non_max_suppression(&output, 0.5, 0.65);
 
         assert_eq!(detections.len(), 3);

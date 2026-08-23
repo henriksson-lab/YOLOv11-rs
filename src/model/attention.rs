@@ -9,18 +9,18 @@ use crate::model::conv::{Activation, Conv, FuseModule};
 // ---------------------------------------------------------------------------
 
 #[derive(Module, Debug)]
-pub struct Attention<B: Backend> {
-    qkv: Conv<B>,
-    conv1: Conv<B>,
-    conv2: Conv<B>,
+pub struct Attention {
+    qkv: Conv,
+    conv1: Conv,
+    conv2: Conv,
     num_head: usize,
     dim_head: usize,
     dim_key: usize,
     scale: f64,
 }
 
-impl<B: Backend> Attention<B> {
-    pub fn new(ch: usize, num_head: usize, device: &B::Device) -> Self {
+impl Attention {
+    pub fn new(ch: usize, num_head: usize, device: &Device) -> Self {
         let dim_head = ch / num_head;
         let dim_key = dim_head / 2;
         let scale = (dim_key as f64).powf(-0.5);
@@ -39,7 +39,7 @@ impl<B: Backend> Attention<B> {
         }
     }
 
-    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+    pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
         let [b, c, h, w] = x.dims();
 
         let qkv = self.qkv.forward(x.clone()); // no activation (identity)
@@ -64,7 +64,7 @@ impl<B: Backend> Attention<B> {
     }
 }
 
-impl<B: Backend> FuseModule for Attention<B> {
+impl FuseModule for Attention {
     fn fuse_module(self) -> Self {
         Self {
             qkv: self.qkv.fuse_module(),
@@ -83,21 +83,21 @@ impl<B: Backend> FuseModule for Attention<B> {
 // ---------------------------------------------------------------------------
 
 #[derive(Module, Debug)]
-pub struct PSABlock<B: Backend> {
-    attn: Attention<B>,
-    ffn1: Conv<B>,
-    ffn2: Conv<B>,
+pub struct PSABlock {
+    attn: Attention,
+    ffn1: Conv,
+    ffn2: Conv,
 }
 
-impl<B: Backend> PSABlock<B> {
-    pub fn new(ch: usize, num_head: usize, device: &B::Device) -> Self {
+impl PSABlock {
+    pub fn new(ch: usize, num_head: usize, device: &Device) -> Self {
         let attn = Attention::new(ch, num_head, device);
         let ffn1 = Conv::new(ch, ch * 2, Activation::SiLU, 1, 1, 0, 1, device);
         let ffn2 = Conv::new(ch * 2, ch, Activation::Identity, 1, 1, 0, 1, device);
         Self { attn, ffn1, ffn2 }
     }
 
-    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+    pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
         let attn_out = self.attn.forward(x.clone());
         let x = x + attn_out;
         let ffn = self.ffn1.forward(x.clone());
@@ -106,7 +106,7 @@ impl<B: Backend> PSABlock<B> {
     }
 }
 
-impl<B: Backend> FuseModule for PSABlock<B> {
+impl FuseModule for PSABlock {
     fn fuse_module(self) -> Self {
         Self {
             attn: self.attn.fuse_module(),
@@ -121,14 +121,14 @@ impl<B: Backend> FuseModule for PSABlock<B> {
 // ---------------------------------------------------------------------------
 
 #[derive(Module, Debug)]
-pub struct PSA<B: Backend> {
-    conv1: Conv<B>,
-    conv2: Conv<B>,
-    res_m: Vec<PSABlock<B>>,
+pub struct PSA {
+    conv1: Conv,
+    conv2: Conv,
+    res_m: Vec<PSABlock>,
 }
 
-impl<B: Backend> PSA<B> {
-    pub fn new(ch: usize, n: usize, device: &B::Device) -> Self {
+impl PSA {
+    pub fn new(ch: usize, n: usize, device: &Device) -> Self {
         let half = ch / 2;
         let conv1 = Conv::new(ch, 2 * half, Activation::SiLU, 1, 1, 0, 1, device);
         let conv2 = Conv::new(2 * half, ch, Activation::SiLU, 1, 1, 0, 1, device);
@@ -144,7 +144,7 @@ impl<B: Backend> PSA<B> {
         }
     }
 
-    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+    pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
         let c1 = self.conv1.forward(x);
         let [_b, c, _h, _w] = c1.dims();
         let half = c / 2;
@@ -158,7 +158,7 @@ impl<B: Backend> PSA<B> {
     }
 }
 
-impl<B: Backend> FuseModule for PSA<B> {
+impl FuseModule for PSA {
     fn fuse_module(self) -> Self {
         Self {
             conv1: self.conv1.fuse_module(),
@@ -175,14 +175,11 @@ impl<B: Backend> FuseModule for PSA<B> {
 #[cfg(test)]
 mod tests {
     use super::PSA;
-    use burn::backend::NdArray;
-
-    type TestBackend = NdArray;
 
     #[test]
     fn psa_new_uses_python_integer_head_count() {
-        let device = Default::default();
-        let psa = PSA::<TestBackend>::new(256, 1, &device);
+        let device = burn::tensor::Device::flex();
+        let psa = PSA::new(256, 1, &device);
 
         assert_eq!(psa.res_m[0].attn.num_head, 2);
         assert_eq!(psa.res_m[0].attn.dim_head, 64);

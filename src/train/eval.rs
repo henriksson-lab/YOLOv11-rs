@@ -10,16 +10,16 @@ use crate::model::nms;
 
 /// Run evaluation on the validation set.
 /// Returns (mAP, mAP50, recall, precision).
-pub fn test<B: Backend>(
-    model: &YOLO<B>,
+pub fn test(
+    model: &YOLO,
     dataset: &Dataset,
-    device: &B::Device,
+    device: &Device,
     batch_size: usize,
 ) -> Result<(f32, f32, f32, f32)> {
     let n = dataset.len();
     let num_batches = (n + batch_size - 1) / batch_size;
 
-    let warmup_input = Tensor::<B, 4>::zeros(
+    let warmup_input = Tensor::<4>::zeros(
         [
             1,
             3,
@@ -61,7 +61,7 @@ pub fn test<B: Backend>(
         let end = (start + batch_size).min(n);
 
         let t0 = Instant::now();
-        let mut samples: Vec<Sample<B>> = Vec::new();
+        let mut samples: Vec<Sample> = Vec::new();
         for i in start..end {
             samples.push(dataset.get_item(i, device)?);
         }
@@ -90,9 +90,9 @@ pub fn test<B: Backend>(
             .clone()
             .squeeze_dim::<1>(1)
             .to_data()
-            .to_vec()
+            .try_to_vec::<f32>()
             .unwrap();
-        let gt_bbox_data: Vec<f32> = batch.bbox.to_data().to_vec().unwrap();
+        let gt_bbox_data: Vec<f32> = batch.bbox.to_data().try_to_vec::<f32>().unwrap();
         let num_gt = gt_cls.len();
         let gt_bbox: Vec<[f32; 4]> = (0..num_gt)
             .map(|i| {
@@ -104,7 +104,7 @@ pub fn test<B: Backend>(
                 ]
             })
             .collect();
-        let gt_idx: Vec<f32> = batch.idx.to_data().to_vec().unwrap();
+        let gt_idx: Vec<f32> = batch.idx.to_data().try_to_vec::<f32>().unwrap();
 
         let input_size = samples[0].image.dims()[2] as f32; // H dimension
 

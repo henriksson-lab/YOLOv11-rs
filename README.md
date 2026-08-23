@@ -4,7 +4,7 @@ YOLOv11 object detection implemented in Rust using the [Candle](https://github.c
 
 Based on the PyTorch re-implementation in [YOLOv11-pt](https://github.com/jahongir7174/YOLOv11-pt).
 
-
+* 2026-08-23: Update to latest Burn. Currently linked my own fork; will fix once PRs accepted
 * 2026-07-03: File-by-file audit done. Seems promising but need to update my CUDA and do deeper testing
 
 
@@ -55,7 +55,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-yolov11 = { path = "../YOLOv11-rs" }
+yolov11 = { git = "https://github.com/henriksson-lab/YOLOv11-rs" }
 candle-core = "0.8"
 candle-nn = "0.8"
 ```
@@ -199,6 +199,25 @@ cargo run --release -- train \
 ```
 
 ### Evaluation
+
+Original benchmark baseline: evaluation is against the local `YOLOv11-pt/`
+PyTorch reference (`v0.0.1-4-ge4987b3-dirty`, commit `e4987b35a1bd`) on
+public COCO `val2017` with local weights. The official image archive is
+`http://images.cocodataset.org/zips/val2017.zip`; annotations/YOLO labels
+are expected in the COCO-format directory described below.
+
+Latest captured benchmark attempt: 2026-07-14, Rust commit `447caf2`. The
+Python reference completed full `Dataset/COCO/val2017.txt` evaluation over
+5,000 images at 7.49 ms/image internally (45.46 s wall by `/usr/bin/time`,
+1,995,072 KiB max RSS). The Rust/Candle CUDA run failed before inference on
+this host because `/usr/lib/x86_64-linux-gnu/libcuda.so.570.133.20` lacks
+`cuCoredumpDeregisterCompleteCallback` required by `cudarc 0.19.4`; a CUDA
+13.2 stub-library retry failed with `CUDA_ERROR_STUB_LIBRARY`. A symbol probe of
+`/usr/lib/x86_64-linux-gnu/libcuda.so.570.133.20` showed `cuInit`,
+`cuDriverGetVersion`, and the coredump get/set symbols, but not
+`cuCoredumpDeregisterCompleteCallback`, so this needs a compatible NVIDIA driver
+runtime rather than a different local dataset path. Raw rows are tracked in
+`benchmarks/YOLOv11-rs.tsv` in the presentation repository.
 
 ```bash
 cargo run --release -- test \

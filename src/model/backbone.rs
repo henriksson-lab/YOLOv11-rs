@@ -7,22 +7,22 @@ use crate::model::conv::{Activation, Conv, FuseModule};
 
 /// DarkNet backbone. Outputs feature maps at 3 scales: p3 (8x), p4 (16x), p5 (32x).
 #[derive(Module, Debug)]
-pub struct DarkNet<B: Backend> {
-    p1: Conv<B>,
-    p2_conv: Conv<B>,
-    p2_csp: CSP<B>,
-    p3_conv: Conv<B>,
-    p3_csp: CSP<B>,
-    p4_conv: Conv<B>,
-    p4_csp: CSP<B>,
-    p5_conv: Conv<B>,
-    p5_csp: CSP<B>,
-    p5_spp: SPP<B>,
-    p5_psa: PSA<B>,
+pub struct DarkNet {
+    p1: Conv,
+    p2_conv: Conv,
+    p2_csp: CSP,
+    p3_conv: Conv,
+    p3_csp: CSP,
+    p4_conv: Conv,
+    p4_csp: CSP,
+    p5_conv: Conv,
+    p5_csp: CSP,
+    p5_spp: SPP,
+    p5_psa: PSA,
 }
 
-impl<B: Backend> DarkNet<B> {
-    pub fn new(width: &[usize], depth: &[usize], csp: &[bool], device: &B::Device) -> Self {
+impl DarkNet {
+    pub fn new(width: &[usize], depth: &[usize], csp: &[bool], device: &Device) -> Self {
         let p1 = Conv::new(width[0], width[1], Activation::SiLU, 3, 2, 1, 1, device);
         let p2_conv = Conv::new(width[1], width[2], Activation::SiLU, 3, 2, 1, 1, device);
         let p2_csp = CSP::new(width[2], width[3], depth[0], csp[0], 4, device);
@@ -50,7 +50,7 @@ impl<B: Backend> DarkNet<B> {
         }
     }
 
-    pub fn forward(&self, x: Tensor<B, 4>) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {
+    pub fn forward(&self, x: Tensor<4>) -> (Tensor<4>, Tensor<4>, Tensor<4>) {
         let p1 = self.p1.forward(x);
         let p2 = self.p2_conv.forward(p1);
         let p2 = self.p2_csp.forward(p2);
@@ -66,7 +66,7 @@ impl<B: Backend> DarkNet<B> {
     }
 }
 
-impl<B: Backend> FuseModule for DarkNet<B> {
+impl FuseModule for DarkNet {
     fn fuse_module(self) -> Self {
         Self {
             p1: self.p1.fuse_module(),

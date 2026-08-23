@@ -16,23 +16,23 @@ impl ParamCollector {
     }
 }
 
-impl<B: Backend> ModuleVisitor<B> for ParamCollector {
-    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+impl ModuleVisitor for ParamCollector {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
         self.params.insert(param.id.val(), param.val().to_data());
     }
 }
 
 /// Maps each float parameter by blending: decay * current + (1 - decay) * source.
-struct EmaMapper<B: Backend> {
+struct EmaMapper {
     source_params: HashMap<u64, TensorData>,
     decay: f64,
-    device: B::Device,
+    device: Device,
 }
 
-impl<B: Backend> ModuleMapper<B> for EmaMapper<B> {
-    fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+impl ModuleMapper for EmaMapper {
+    fn map_float<const D: usize>(&mut self, param: Param<Tensor<D>>) -> Param<Tensor<D>> {
         if let Some(source_data) = self.source_params.get(&param.id.val()) {
-            let source = Tensor::<B, D>::from_data(source_data.clone(), &self.device);
+            let source = Tensor::<D>::from_data(source_data.clone(), &self.device);
             // ema = decay * ema + (1 - decay) * model
             let blended = param.val() * self.decay + source * (1.0 - self.decay);
             param.map(|_| blended)
@@ -43,15 +43,14 @@ impl<B: Backend> ModuleMapper<B> for EmaMapper<B> {
 }
 
 /// Exponential Moving Average of model parameters.
-pub struct EMA<B: Backend, M: Module<B>> {
+pub struct EMA<M: Module> {
     shadow: M,
     decay: f64,
     tau: f64,
     updates: usize,
-    _marker: std::marker::PhantomData<B>,
 }
 
-impl<B: Backend, M: Module<B>> EMA<B, M> {
+impl<M: Module> EMA<M> {
     pub fn new(model: &M, decay: f64, tau: f64) -> Self {
         let shadow = model.clone();
         Self {
@@ -59,13 +58,12 @@ impl<B: Backend, M: Module<B>> EMA<B, M> {
             decay,
             tau,
             updates: 0,
-            _marker: std::marker::PhantomData,
         }
     }
 
     /// Update EMA parameters from current model.
     /// ema = d * ema + (1-d) * model, where d ramps up over time.
-    pub fn update(&mut self, model: &M, device: &B::Device) {
+    pub fn update(&mut self, model: &M, device: &Device) {
         self.updates += 1;
         let d = self.decay * (1.0 - (-((self.updates as f64) / self.tau)).exp());
 
@@ -74,7 +72,7 @@ impl<B: Backend, M: Module<B>> EMA<B, M> {
         model.visit(&mut collector);
 
         // Blend shadow parameters with model parameters
-        let mut mapper = EmaMapper::<B> {
+        let mut mapper = EmaMapper {
             source_params: collector.params,
             decay: d,
             device: device.clone(),
@@ -91,38 +89,35 @@ impl<B: Backend, M: Module<B>> EMA<B, M> {
 #[cfg(test)]
 mod tests {
     use super::EMA;
-    use burn::backend::NdArray;
     use burn::module::{Module, Param};
     use burn::prelude::*;
 
-    type TestBackend = NdArray;
-
     #[derive(Module, Debug)]
-    struct TinyModule<B: Backend> {
-        weight: Param<Tensor<B, 1>>,
+    struct TinyModule {
+        weight: Param<Tensor<1>>,
     }
 
-    impl<B: Backend> TinyModule<B> {
-        fn new(value: f32, device: &B::Device) -> Self {
+    impl TinyModule {
+        fn new(value: f32, device: &Device) -> Self {
             Self {
                 weight: Param::from_tensor(Tensor::from_floats([value], device)),
             }
         }
 
-        fn with_weight(mut self, value: f32, device: &B::Device) -> Self {
+        fn with_weight(mut self, value: f32, device: &Device) -> Self {
             self.weight = self.weight.map(|_| Tensor::from_floats([value], device));
             self
         }
 
         fn weight_value(&self) -> f32 {
-            self.weight.val().to_data().to_vec::<f32>().unwrap()[0]
+            self.weight.val().to_data().try_to_vec::<f32>().unwrap()[0]
         }
     }
 
     #[test]
     fn ema_update_matches_python_decay_ramp_fixture() {
-        let device = Default::default();
-        let model = TinyModule::<TestBackend>::new(2.0, &device);
+        let device = burn::tensor::Device::flex();
+        let model = TinyModule::new(2.0, &device);
         let mut ema = EMA::new(&model, 0.9, 2.0);
 
         let model_after_first_update = model.clone().with_weight(10.0, &device);

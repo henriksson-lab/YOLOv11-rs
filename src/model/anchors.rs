@@ -3,16 +3,16 @@ use burn::prelude::*;
 /// Generate anchor points and stride tensors for multi-scale feature maps.
 ///
 /// Returns (anchors [total, 2], strides [total, 1]).
-pub fn make_anchors<B: Backend>(
-    feature_maps: &[Tensor<B, 4>],
-    strides: &Tensor<B, 1>,
+pub fn make_anchors(
+    feature_maps: &[Tensor<4>],
+    strides: &Tensor<1>,
     offset: f64,
-    device: &B::Device,
-) -> (Tensor<B, 2>, Tensor<B, 2>) {
-    let strides_vec: Vec<f32> = strides.to_data().to_vec().unwrap();
+    device: &Device,
+) -> (Tensor<2>, Tensor<2>) {
+    let strides_vec: Vec<f32> = strides.to_data().try_to_vec::<f32>().unwrap();
 
-    let mut anchor_list: Vec<Tensor<B, 2>> = Vec::new();
-    let mut stride_list: Vec<Tensor<B, 2>> = Vec::new();
+    let mut anchor_list: Vec<Tensor<2>> = Vec::new();
+    let mut stride_list: Vec<Tensor<2>> = Vec::new();
 
     for (i, fm) in feature_maps.iter().enumerate() {
         let [_, _, h, w] = fm.dims();
@@ -30,14 +30,12 @@ pub fn make_anchors<B: Backend>(
                 anchor_data.push(sy[y]);
             }
         }
-        let anchors =
-            Tensor::<B, 1>::from_floats(anchor_data.as_slice(), device).reshape([h * w, 2]);
+        let anchors = Tensor::<1>::from_floats(anchor_data.as_slice(), device).reshape([h * w, 2]);
         anchor_list.push(anchors);
 
         // Stride tensor [H*W, 1]
         let stride_data: Vec<f32> = vec![stride_val; h * w];
-        let stride_t =
-            Tensor::<B, 1>::from_floats(stride_data.as_slice(), device).reshape([h * w, 1]);
+        let stride_t = Tensor::<1>::from_floats(stride_data.as_slice(), device).reshape([h * w, 1]);
         stride_list.push(stride_t);
     }
 
@@ -47,7 +45,7 @@ pub fn make_anchors<B: Backend>(
 }
 
 /// Convert boxes from [cx, cy, w, h] to [x1, y1, x2, y2].
-pub fn wh2xy<B: Backend>(x: &Tensor<B, 2>) -> Tensor<B, 2> {
+pub fn wh2xy(x: &Tensor<2>) -> Tensor<2> {
     let cx = x.clone().narrow(1, 0, 1);
     let cy = x.clone().narrow(1, 1, 1);
     let w = x.clone().narrow(1, 2, 1);
@@ -64,36 +62,33 @@ pub fn wh2xy<B: Backend>(x: &Tensor<B, 2>) -> Tensor<B, 2> {
 #[cfg(test)]
 mod tests {
     use super::{make_anchors, wh2xy};
-    use burn::backend::NdArray;
     use burn::prelude::*;
-
-    type TestBackend = NdArray;
 
     #[test]
     fn make_anchors_matches_python_grid_order_and_shapes() {
-        let device = Default::default();
-        let x0 = Tensor::<TestBackend, 4>::zeros([1, 8, 2, 3], &device);
-        let x1 = Tensor::<TestBackend, 4>::zeros([1, 8, 1, 2], &device);
-        let strides = Tensor::<TestBackend, 1>::from_floats([8.0, 16.0], &device);
+        let device = burn::tensor::Device::flex();
+        let x0 = Tensor::<4>::zeros([1, 8, 2, 3], &device);
+        let x1 = Tensor::<4>::zeros([1, 8, 1, 2], &device);
+        let strides = Tensor::<1>::from_floats([8.0, 16.0], &device);
 
         let (anchors, stride_tensor) = make_anchors(&[x0, x1], &strides, 0.5, &device);
 
         assert_eq!(anchors.dims(), [8, 2]);
         assert_eq!(stride_tensor.dims(), [8, 1]);
         assert_eq!(
-            anchors.to_data().to_vec::<f32>().unwrap(),
+            anchors.to_data().try_to_vec::<f32>().unwrap(),
             vec![0.5, 0.5, 1.5, 0.5, 2.5, 0.5, 0.5, 1.5, 1.5, 1.5, 2.5, 1.5, 0.5, 0.5, 1.5, 0.5,]
         );
         assert_eq!(
-            stride_tensor.to_data().to_vec::<f32>().unwrap(),
+            stride_tensor.to_data().try_to_vec::<f32>().unwrap(),
             vec![8.0, 8.0, 8.0, 8.0, 8.0, 8.0, 16.0, 16.0]
         );
     }
 
     #[test]
     fn wh2xy_matches_python_edge_fixture() {
-        let device = Default::default();
-        let boxes = Tensor::<TestBackend, 1>::from_floats(
+        let device = burn::tensor::Device::flex();
+        let boxes = Tensor::<1>::from_floats(
             [
                 10.0, 12.0, 4.0, 6.0, -2.0, 3.0, 8.0, 10.0, 0.0, 0.0, 0.0, 2.0,
             ],
@@ -103,7 +98,7 @@ mod tests {
 
         let xy = wh2xy(&boxes);
         assert_eq!(
-            xy.to_data().to_vec::<f32>().unwrap(),
+            xy.to_data().try_to_vec::<f32>().unwrap(),
             vec![8.0, 9.0, 12.0, 15.0, -6.0, -2.0, 2.0, 8.0, 0.0, -1.0, 0.0, 1.0]
         );
     }

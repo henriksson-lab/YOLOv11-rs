@@ -1,5 +1,5 @@
 use anyhow::Result;
-use burn::optim::{decay::WeightDecayConfig, GradientsParams, Optimizer, SgdConfig};
+use burn::optim::{decay::WeightDecayConfig, GradientsParams, SgdConfig};
 use burn::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::Write;
@@ -15,38 +15,25 @@ use crate::train::eval;
 use crate::train::lr_schedule::LinearLR;
 use crate::train::util::AverageMeter;
 
-pub fn train<B: Backend>(
+pub fn train(
     config: &Config,
     data_dir: &str,
     input_size: usize,
     batch_size: usize,
     epochs: usize,
-    device: &B::Device,
-) -> Result<()>
-where
-    B: burn::tensor::backend::AutodiffBackend,
-{
+    // Evaluate every this many epochs (1 = every epoch, as before). Validation
+    // is the expensive phase on a small dataset, both in time and — because the
+    // inference shape set is not the training one — in device memory.
+    eval_interval: usize,
+    device: &Device,
+) -> Result<()> {
     let num_classes = config.num_classes();
 
     // Create model
-    let model: YOLO<B> = yolo_v11_n(num_classes, device);
+    let model: YOLO = yolo_v11_n(num_classes, device);
 
     // Optimizer
     let world_size = 1usize;
-    let accumulate = (64.0 / (batch_size * world_size) as f64).round().max(1.0) as usize;
-    let weight_decay = config.weight_decay * (batch_size * world_size * accumulate) as f64 / 64.0;
-
-    let mut optimizer = SgdConfig::new()
-        .with_weight_decay(Some(WeightDecayConfig {
-            penalty: weight_decay as f32,
-        }))
-        .with_momentum(Some(burn::optim::momentum::MomentumConfig {
-            momentum: config.momentum,
-            dampening: 0.0,
-            nesterov: true,
-        }))
-        .init();
-
     // Dataset
     let data_dir_path = Path::new(data_dir);
     let train_filenames = std::fs::read_to_string(data_dir_path.join("train2017.txt"))?
@@ -82,8 +69,31 @@ where
         &config.to_augment_params(),
     )?;
 
-    // Scheduler
+    // Optimizer
+    //
+    // `accumulate` is capped at the number of steps in an epoch. The nominal
+    // `64 / batch_size` assumes an epoch long enough to contain it; on a small
+    // dataset it is not, and the optimizer would then step roughly once per
+    // epoch while `pending_loss` carried an autodiff graph over every step of
+    // it. That is a fourfold difference in device memory here, and it is what
+    // used to exhaust a 16 GB card by epoch 5.
     let num_steps = (train_dataset.len() + batch_size - 1) / batch_size;
+    let accumulate = ((64.0 / (batch_size * world_size) as f64).round().max(1.0) as usize)
+        .min(num_steps.max(1));
+    let weight_decay = config.weight_decay * (batch_size * world_size * accumulate) as f64 / 64.0;
+
+    let mut optimizer = SgdConfig::new()
+        .with_weight_decay(Some(WeightDecayConfig {
+            penalty: weight_decay as f32,
+        }))
+        .with_momentum(Some(burn::optim::momentum::MomentumConfig {
+            momentum: config.momentum,
+            dampening: 0.0,
+            nesterov: true,
+        }))
+        .init();
+
+    // Scheduler
     let scheduler = LinearLR::new(
         config.min_lr,
         config.max_lr,
@@ -96,7 +106,7 @@ where
     let mut ema = EMA::new(&model, 0.9999, 2000.0);
 
     // Loss
-    let criterion = ComputeLoss::new::<B>(
+    let criterion = ComputeLoss::new(
         num_classes,
         3,
         &model.stride,
@@ -133,7 +143,7 @@ where
         let mut avg_box_loss = AverageMeter::new();
         let mut avg_cls_loss = AverageMeter::new();
         let mut avg_dfl_loss = AverageMeter::new();
-        let mut pending_loss: Option<Tensor<B, 1>> = None;
+        let mut pending_loss: Option<Tensor<1>> = None;
 
         let mut indices: Vec<usize> = (0..train_dataset.len()).collect();
         crate::rng::shuffle(&mut indices);
@@ -148,7 +158,7 @@ where
                 break;
             }
 
-            let mut samples: Vec<Sample<B>> = Vec::new();
+            let mut samples: Vec<Sample> = Vec::new();
             for &idx in &indices[start..end] {
                 samples.push(train_dataset.get_item(idx, device)?);
             }
@@ -191,9 +201,9 @@ where
                 ema.update(&model, device);
             }
 
-            let lb: f32 = loss_box.into_data().to_vec().unwrap()[0];
-            let lc: f32 = loss_cls.into_data().to_vec().unwrap()[0];
-            let ld: f32 = loss_dfl.into_data().to_vec().unwrap()[0];
+            let lb: f32 = loss_box.into_data().try_to_vec::<f32>().unwrap()[0];
+            let lc: f32 = loss_cls.into_data().try_to_vec::<f32>().unwrap()[0];
+            let ld: f32 = loss_dfl.into_data().try_to_vec::<f32>().unwrap()[0];
             avg_box_loss.update(lb as f64, samples.len());
             avg_cls_loss.update(lc as f64, samples.len());
             avg_dfl_loss.update(ld as f64, samples.len());
@@ -211,45 +221,45 @@ where
         }
         pb.finish();
 
-        // Evaluate with EMA model
-        let ema_model = ema.model();
-        let (mean_ap, map50, recall, precision) = eval::test(ema_model, &val_dataset, device, 4)?;
+        // Evaluate with EMA model. The last epoch always evaluates, so a run
+        // ends with a measured model however the interval divides.
+        let evaluated = eval_interval <= 1
+            || epoch + 1 == epochs
+            || (epoch + 1) % eval_interval == 0;
 
-        // Log
-        writeln!(
-            csv_file,
-            "{:03},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
-            epoch + 1,
-            avg_box_loss.avg,
-            avg_cls_loss.avg,
-            avg_dfl_loss.avg,
-            recall,
-            precision,
-            map50,
-            mean_ap
-        )?;
-        csv_file.flush()?;
-
-        // Save EMA checkpoint like Python's copied `ema.ema` model.
-        if mean_ap > best_map {
-            best_map = mean_ap;
-        }
         let save_model = ema.model().clone();
         save_model
             .clone()
-            .save_file(
-                "weights/last",
-                &burn::record::DefaultFileRecorder::<burn::record::FullPrecisionSettings>::new(),
-            )
+            .save_file("weights/last")
             .map_err(|e| anyhow::anyhow!("Failed to save model: {}", e))?;
-        if best_map == mean_ap {
-            save_model
-                .save_file(
-                    "weights/best",
-                    &burn::record::DefaultFileRecorder::<burn::record::FullPrecisionSettings>::new(
-                    ),
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to save model: {}", e))?;
+
+        if evaluated {
+            let ema_model = ema.model();
+            let (mean_ap, map50, recall, precision) =
+                eval::test(ema_model, &val_dataset, device, 4)?;
+
+            // Log
+            writeln!(
+                csv_file,
+                "{:03},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+                epoch + 1,
+                avg_box_loss.avg,
+                avg_cls_loss.avg,
+                avg_dfl_loss.avg,
+                recall,
+                precision,
+                map50,
+                mean_ap
+            )?;
+            csv_file.flush()?;
+
+            // Save EMA checkpoint like Python's copied `ema.ema` model.
+            if mean_ap > best_map {
+                best_map = mean_ap;
+                save_model
+                    .save_file("weights/best")
+                    .map_err(|e| anyhow::anyhow!("Failed to save model: {}", e))?;
+            }
         }
     }
 

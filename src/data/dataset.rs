@@ -31,9 +31,9 @@ pub struct Dataset {
 }
 
 /// A single sample returned by the dataset.
-pub struct Sample<B: Backend> {
+pub struct Sample {
     /// Image tensor [3, H, W] in 0..1 range.
-    pub image: Tensor<B, 3>,
+    pub image: Tensor<3>,
     /// Class labels [N].
     pub cls: Vec<f32>,
     /// Bounding boxes [N, 4] in normalized (cx, cy, w, h).
@@ -83,8 +83,8 @@ impl Dataset {
     }
 
     /// Get a single sample (with augmentation if enabled).
-    pub fn get_item<B: Backend>(&self, index: usize, device: &B::Device) -> Result<Sample<B>> {
-        let to_sample = |img: &image::RgbImage| -> Tensor<B, 3> {
+    pub fn get_item(&self, index: usize, device: &Device) -> Result<Sample> {
+        let to_sample = |img: &image::RgbImage| -> Tensor<3> {
             let (w, h) = img.dimensions();
             let raw = img.as_raw();
             let hw = (h * w) as usize;
@@ -97,8 +97,7 @@ impl Dataset {
                     sample[2 * hw + y * w as usize + x] = raw[idx] as f32;
                 }
             }
-            Tensor::<B, 1>::from_floats(sample.as_slice(), device)
-                .reshape([3, h as usize, w as usize])
+            Tensor::<1>::from_floats(sample.as_slice(), device).reshape([3, h as usize, w as usize])
         };
         let to_targets = |labels: &[Label]| -> (Vec<f32>, Vec<[f32; 4]>) {
             let mut cls = Vec::with_capacity(labels.len());
@@ -540,20 +539,20 @@ pub struct AugmentParams {
 }
 
 /// Simple batch collation.
-pub struct Batch<B: Backend> {
+pub struct Batch {
     /// [B, 3, H, W]
-    pub images: Tensor<B, 4>,
+    pub images: Tensor<4>,
     /// Flat class labels [total_targets, 1].
-    pub cls: Tensor<B, 2>,
+    pub cls: Tensor<2>,
     /// Flat bounding boxes [total_targets, 4].
-    pub bbox: Tensor<B, 2>,
+    pub bbox: Tensor<2>,
     /// Batch index per target [total_targets].
-    pub idx: Tensor<B, 1>,
+    pub idx: Tensor<1>,
 }
 
 impl Dataset {
-    pub fn collate_fn<B: Backend>(samples: &[Sample<B>], device: &B::Device) -> Batch<B> {
-        let imgs: Vec<Tensor<B, 4>> = samples
+    pub fn collate_fn(samples: &[Sample], device: &Device) -> Batch {
+        let imgs: Vec<Tensor<4>> = samples
             .iter()
             .map(|s| s.image.clone().unsqueeze_dim(0))
             .collect();
@@ -574,14 +573,14 @@ impl Dataset {
         let n = all_cls.len();
         // Burn does not support 0-element tensors; use a dummy target when batch has no labels
         let (cls, bbox, idx) = if n == 0 {
-            let cls = Tensor::<B, 2>::zeros([1, 1], device);
-            let bbox = Tensor::<B, 2>::zeros([1, 4], device);
-            let idx = Tensor::<B, 1>::from_floats([-1.0f32].as_slice(), device);
+            let cls = Tensor::<2>::zeros([1, 1], device);
+            let bbox = Tensor::<2>::zeros([1, 4], device);
+            let idx = Tensor::<1>::from_floats([-1.0f32].as_slice(), device);
             (cls, bbox, idx)
         } else {
-            let cls = Tensor::<B, 1>::from_floats(all_cls.as_slice(), device).reshape([n, 1]);
-            let bbox = Tensor::<B, 1>::from_floats(all_bbox.as_slice(), device).reshape([n, 4]);
-            let idx = Tensor::<B, 1>::from_floats(all_idx.as_slice(), device);
+            let cls = Tensor::<1>::from_floats(all_cls.as_slice(), device).reshape([n, 1]);
+            let bbox = Tensor::<1>::from_floats(all_bbox.as_slice(), device).reshape([n, 4]);
+            let idx = Tensor::<1>::from_floats(all_idx.as_slice(), device);
             (cls, bbox, idx)
         };
 
@@ -629,7 +628,6 @@ pub fn xy2wh(labels: &[Label], w: f32, h: f32) -> Vec<Label> {
 #[cfg(test)]
 mod tests {
     use super::{wh2xy, xy2wh, Albumentations, AugmentParams, Dataset, Label};
-    use burn::backend::ndarray::NdArray;
     use image::{GenericImageView, ImageFormat, Rgb, RgbImage};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -908,9 +906,9 @@ mod tests {
         img.save(&image).unwrap();
 
         let dataset = Dataset::new(vec![image], 12, false, &augment_params()).unwrap();
-        let device = Default::default();
-        let sample = dataset.get_item::<NdArray>(0, &device).unwrap();
-        let data: Vec<f32> = sample.image.to_data().to_vec().unwrap();
+        let device = burn::tensor::Device::flex();
+        let sample = dataset.get_item(0, &device).unwrap();
+        let data: Vec<f32> = sample.image.to_data().try_to_vec::<f32>().unwrap();
         let hw = 12 * 12;
 
         assert_eq!(data[0], 10.0);
@@ -934,10 +932,10 @@ mod tests {
         img.save(&image).unwrap();
 
         let dataset = Dataset::new(vec![image], 24, false, &augment_params()).unwrap();
-        let device = Default::default();
-        let sample = dataset.get_item::<NdArray>(0, &device).unwrap();
+        let device = burn::tensor::Device::flex();
+        let sample = dataset.get_item(0, &device).unwrap();
         let dims = sample.image.dims();
-        let data: Vec<f32> = sample.image.to_data().to_vec().unwrap();
+        let data: Vec<f32> = sample.image.to_data().try_to_vec::<f32>().unwrap();
         let hw = 24 * 24;
 
         assert_eq!(dims, [3, 24, 24]);
@@ -986,8 +984,8 @@ mod tests {
         fs::write(labels.join("full_box.txt"), "0 0.5 0.5 1.0 1.0\n").unwrap();
 
         let dataset = Dataset::new(vec![image], 12, false, &augment_params()).unwrap();
-        let device = Default::default();
-        let sample = dataset.get_item::<NdArray>(0, &device).unwrap();
+        let device = burn::tensor::Device::flex();
+        let sample = dataset.get_item(0, &device).unwrap();
         let expected_edge = (12.0_f32 - 1e-3) / 12.0;
 
         assert_eq!(sample.cls, vec![0.0]);

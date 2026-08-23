@@ -12,20 +12,20 @@ use crate::model::conv::{Activation, Conv, FuseModule};
 // ---------------------------------------------------------------------------
 
 #[derive(Module, Debug)]
-pub struct DFL<B: Backend> {
+pub struct DFL {
     /// Fixed weight tensor [1, ch, 1, 1] containing [0, 1, 2, ..., ch-1].
-    weight: Tensor<B, 4>,
+    weight: Tensor<4>,
 }
 
-impl<B: Backend> DFL<B> {
-    pub fn new(ch: usize, device: &B::Device) -> Self {
+impl DFL {
+    pub fn new(ch: usize, device: &Device) -> Self {
         let w: Vec<f32> = (0..ch).map(|i| i as f32).collect();
-        let weight = Tensor::<B, 1>::from_floats(w.as_slice(), device).reshape([1, ch, 1, 1]);
+        let weight = Tensor::<1>::from_floats(w.as_slice(), device).reshape([1, ch, 1, 1]);
         Self { weight }
     }
 
     /// Input: [B, 4*ch, A].  Output: [B, 4, A].
-    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let [b, _c, a] = x.dims();
         let ch = self.weight.dims()[1];
         let x = x.reshape([b, 4, ch, a]);
@@ -42,30 +42,30 @@ impl<B: Backend> DFL<B> {
 // ---------------------------------------------------------------------------
 
 #[derive(Module, Debug)]
-pub struct Head<B: Backend> {
+pub struct Head {
     nc: usize,
     nl: usize,
     ch: usize,
-    stride: Tensor<B, 1>,
-    dfl: DFL<B>,
-    box_c0: Vec<Conv<B>>,
-    box_c1: Vec<Conv<B>>,
-    box_c2: Vec<Conv2d<B>>,
-    cls_c0: Vec<Conv<B>>,
-    cls_c1: Vec<Conv<B>>,
-    cls_c2: Vec<Conv<B>>,
-    cls_c3: Vec<Conv<B>>,
-    cls_c4: Vec<Conv2d<B>>,
+    stride: Tensor<1>,
+    dfl: DFL,
+    box_c0: Vec<Conv>,
+    box_c1: Vec<Conv>,
+    box_c2: Vec<Conv2d>,
+    cls_c0: Vec<Conv>,
+    cls_c1: Vec<Conv>,
+    cls_c2: Vec<Conv>,
+    cls_c3: Vec<Conv>,
+    cls_c4: Vec<Conv2d>,
 }
 
 #[derive(Debug)]
-pub enum HeadOutput<B: Backend> {
-    Train(Vec<Tensor<B, 4>>),
-    Infer(Tensor<B, 3>),
+pub enum HeadOutput {
+    Train(Vec<Tensor<4>>),
+    Infer(Tensor<3>),
 }
 
-impl<B: Backend> Head<B> {
-    pub fn new(nc: usize, filters: &[usize], stride: Tensor<B, 1>, device: &B::Device) -> Self {
+impl Head {
+    pub fn new(nc: usize, filters: &[usize], stride: Tensor<1>, device: &Device) -> Self {
         let ch: usize = 16;
         let nl = filters.len();
         let dfl = DFL::new(ch, device);
@@ -156,7 +156,7 @@ impl<B: Backend> Head<B> {
         }
     }
 
-    pub fn forward(&self, xs: &[Tensor<B, 4>], training: bool) -> HeadOutput<B> {
+    pub fn forward(&self, xs: &[Tensor<4>], training: bool) -> HeadOutput {
         let mut outputs = Vec::with_capacity(self.nl);
         for (i, x) in xs.iter().enumerate() {
             let box_out = self.box_c0[i].forward(x.clone());
@@ -182,15 +182,15 @@ impl<B: Backend> Head<B> {
         let no = nc + ch * 4;
 
         let device = outputs[0].device();
-        let (anchors, strides) = make_anchors::<B>(&outputs, &self.stride, 0.5, &device);
+        let (anchors, strides) = make_anchors(&outputs, &self.stride, 0.5, &device);
         let anchors = anchors.swap_dims(0, 1); // [2, total]
         let strides = strides.swap_dims(0, 1); // [1, total]
                                                // Add batch dim for broadcasting
-        let anchors: Tensor<B, 3> = anchors.unsqueeze_dim(0); // [1, 2, total]
-        let strides: Tensor<B, 3> = strides.unsqueeze_dim(0); // [1, 1, total]
+        let anchors: Tensor<3> = anchors.unsqueeze_dim(0); // [1, 2, total]
+        let strides: Tensor<3> = strides.unsqueeze_dim(0); // [1, 1, total]
 
         let b = outputs[0].dims()[0];
-        let mut flat: Vec<Tensor<B, 3>> = Vec::new();
+        let mut flat: Vec<Tensor<3>> = Vec::new();
         for o in &outputs {
             let [_, _, h, w] = o.dims();
             flat.push(o.clone().reshape([b, no, h * w]));
@@ -219,11 +219,11 @@ impl<B: Backend> Head<B> {
     pub fn initialize_biases(&mut self) {
         let nc = self.nc;
         let ch = self.ch;
-        let stride_values: Vec<f32> = self.stride.clone().to_data().to_vec().unwrap();
+        let stride_values: Vec<f32> = self.stride.clone().to_data().try_to_vec::<f32>().unwrap();
 
         for i in 0..self.nl {
             let device = self.box_c2[i].weight.val().device();
-            self.box_c2[i].bias = Some(Param::from_tensor(Tensor::<B, 1>::full(
+            self.box_c2[i].bias = Some(Param::from_tensor(Tensor::<1>::full(
                 [4 * ch],
                 1.0,
                 &device,
@@ -231,7 +231,7 @@ impl<B: Backend> Head<B> {
 
             let s = stride_values[i] as f64;
             let cls_bias = (5.0 / nc as f64 / (640.0 / s).powi(2)).ln() as f32;
-            self.cls_c4[i].bias = Some(Param::from_tensor(Tensor::<B, 1>::full(
+            self.cls_c4[i].bias = Some(Param::from_tensor(Tensor::<1>::full(
                 [nc],
                 cls_bias,
                 &device,
@@ -240,7 +240,7 @@ impl<B: Backend> Head<B> {
     }
 }
 
-impl<B: Backend> FuseModule for Head<B> {
+impl FuseModule for Head {
     fn fuse_module(self) -> Self {
         Self {
             nc: self.nc,
@@ -287,16 +287,13 @@ impl<B: Backend> FuseModule for Head<B> {
 #[cfg(test)]
 mod tests {
     use super::{Head, HeadOutput, DFL};
-    use burn::backend::NdArray;
     use burn::prelude::*;
-
-    type TestBackend = NdArray;
 
     #[test]
     fn dfl_forward_matches_python_projection_fixture() {
-        let device = Default::default();
-        let dfl = DFL::<TestBackend>::new(4, &device);
-        let x = Tensor::<TestBackend, 1>::from_floats(
+        let device = burn::tensor::Device::flex();
+        let dfl = DFL::new(4, &device);
+        let x = Tensor::<1>::from_floats(
             [
                 0.2, 0.3, -0.1, 0.1, 0.4, -0.2, 1.0, 0.5, 1.2, 0.7, 0.3, -0.4, -0.7, 0.2, 0.0, 0.0,
                 -0.5, -0.1, 0.8, 0.2, 0.1, 0.4, -1.0, -0.8, 0.0, 1.0, 0.0, 0.0, 0.0, -0.5, 0.0,
@@ -306,7 +303,7 @@ mod tests {
         )
         .reshape([1, 16, 2]);
 
-        let out = dfl.forward(x).to_data().to_vec::<f32>().unwrap();
+        let out = dfl.forward(x).to_data().try_to_vec::<f32>().unwrap();
         let expected = [
             1.9006745, 1.5619756, 0.86645204, 1.2461841, 1.286728, 1.3652573, 1.5, 1.0596901,
         ];
@@ -318,9 +315,9 @@ mod tests {
 
     #[test]
     fn initialize_biases_sets_python_head_bias_values() {
-        let device = Default::default();
-        let stride = Tensor::<TestBackend, 1>::from_floats([8.0, 16.0, 32.0], &device);
-        let mut head = Head::<TestBackend>::new(3, &[16, 32, 64], stride, &device);
+        let device = burn::tensor::Device::flex();
+        let stride = Tensor::<1>::from_floats([8.0, 16.0, 32.0], &device);
+        let mut head = Head::new(3, &[16, 32, 64], stride, &device);
 
         head.initialize_biases();
 
@@ -330,7 +327,7 @@ mod tests {
             .unwrap()
             .val()
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         assert!(box_bias.iter().all(|v| (*v - 1.0).abs() < 1e-6));
 
@@ -340,7 +337,7 @@ mod tests {
             .unwrap()
             .val()
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let expected = (5.0f32 / 3.0 / (640.0f32 / 8.0).powi(2)).ln();
         assert!(cls_bias.iter().all(|v| (*v - expected).abs() < 1e-6));
@@ -348,14 +345,14 @@ mod tests {
 
     #[test]
     fn head_forward_training_and_inference_shapes_match_python_layout() {
-        let device = Default::default();
-        let stride = Tensor::<TestBackend, 1>::from_floats([8.0, 16.0, 32.0], &device);
-        let mut head = Head::<TestBackend>::new(2, &[8, 16, 32], stride, &device);
+        let device = burn::tensor::Device::flex();
+        let stride = Tensor::<1>::from_floats([8.0, 16.0, 32.0], &device);
+        let mut head = Head::new(2, &[8, 16, 32], stride, &device);
         head.initialize_biases();
         let xs = vec![
-            Tensor::<TestBackend, 4>::zeros([1, 8, 4, 4], &device),
-            Tensor::<TestBackend, 4>::zeros([1, 16, 2, 2], &device),
-            Tensor::<TestBackend, 4>::zeros([1, 32, 1, 1], &device),
+            Tensor::<4>::zeros([1, 8, 4, 4], &device),
+            Tensor::<4>::zeros([1, 16, 2, 2], &device),
+            Tensor::<4>::zeros([1, 32, 1, 1], &device),
         ];
 
         match head.forward(&xs, true) {

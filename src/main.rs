@@ -1,23 +1,14 @@
 use anyhow::Result;
-use burn::backend::Autodiff;
 use burn::prelude::*;
-use clap::{Parser, Subcommand};
-
-#[cfg(not(feature = "cuda"))]
-use burn::backend::wgpu::{Wgpu, WgpuDevice};
 #[cfg(feature = "cuda")]
-use burn::backend::{cuda::CudaDevice, Cuda};
+use burn::tensor::DeviceIndex;
+#[cfg(not(feature = "cuda"))]
+use burn::tensor::DeviceKind;
+use clap::{Parser, Subcommand};
 
 use yolov11::data;
 use yolov11::model;
 use yolov11::train;
-
-#[cfg(feature = "cuda")]
-type MyBackend = Cuda;
-#[cfg(not(feature = "cuda"))]
-type MyBackend = Wgpu;
-
-type MyAutodiffBackend = Autodiff<MyBackend>;
 
 #[derive(Parser, Debug)]
 #[command(name = "yolov11", about = "YOLOv11 training and evaluation in Rust")]
@@ -49,6 +40,11 @@ enum Command {
         /// Number of training epochs
         #[arg(long, default_value_t = 600)]
         epochs: usize,
+
+        /// Evaluate every N epochs (1 = every epoch). Validation is the
+        /// expensive phase on a small dataset; the last epoch always evaluates.
+        #[arg(long, default_value_t = 1)]
+        eval_interval: usize,
 
         /// Path to weights file to resume from
         #[arg(long)]
@@ -87,9 +83,9 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     #[cfg(feature = "cuda")]
-    let device = CudaDevice::default();
+    let device = Device::cuda(DeviceIndex::Default);
     #[cfg(not(feature = "cuda"))]
-    let device = WgpuDevice::default();
+    let device = Device::wgpu(DeviceKind::DefaultDevice);
 
     #[cfg(feature = "cuda")]
     println!("Using device: CUDA");
@@ -106,6 +102,7 @@ fn main() -> Result<()> {
             input_size,
             batch_size,
             epochs,
+            eval_interval,
             weights: _,
         } => {
             let config = train::config::Config::load(&std::path::PathBuf::from(&config))?;
@@ -113,8 +110,14 @@ fn main() -> Result<()> {
 
             train::profile::profile(&config, input_size)?;
 
-            train::train::train::<MyAutodiffBackend>(
-                &config, &data_dir, input_size, batch_size, epochs, &device,
+            train::train::train(
+                &config,
+                &data_dir,
+                input_size,
+                batch_size,
+                epochs,
+                eval_interval,
+                &device.clone().autodiff(),
             )?;
         }
         Command::Test {
@@ -128,15 +131,14 @@ fn main() -> Result<()> {
             println!("Loaded config with {} classes", num_classes);
             train::profile::profile(&config, input_size)?;
 
-            let model: model::model::YOLO<MyBackend> =
-                model::model::yolo_v11_n(num_classes, &device);
+            let model: model::model::YOLO = model::model::yolo_v11_n(num_classes, &device);
 
             // Load weights if provided
             let model = if let Some(weights_path) = weights {
                 if weights_path.ends_with(".pt") || weights_path.ends_with(".pth") {
                     anyhow::bail!(
-                        "Direct .pt loading is not supported in burn 0.21 pre-release \
-                         (broken transitive dep). Convert to .safetensors first."
+                        "Direct .pt loading is not supported. \
+                         Convert to .safetensors first."
                     );
                 } else if weights_path.ends_with(".safetensors") {
                     println!("Loading safetensors weights from {}", weights_path);
@@ -150,7 +152,7 @@ fn main() -> Result<()> {
                 } else {
                     println!("Loading weights from {}", weights_path);
                     model
-                        .load_file(&weights_path, &burn::record::DefaultFileRecorder::<burn::record::FullPrecisionSettings>::new(), &device)
+                        .try_load_file(&weights_path)
                         .map_err(|e| anyhow::anyhow!("Failed to load weights: {}", e))?
                 }
             } else {
