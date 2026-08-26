@@ -24,7 +24,7 @@ csv = "1"
 zune-jpeg = "0.5"
 
 [patch.crates-io]
-# Standardised on the fork at /home/mahogny/github/claude/burn, which carries
-# tracel-ai/burn#5400 (the fusion fix); published 0.22.0-pre.2 does not.
-burn = { path = "/home/mahogny/github/claude/burn/crates/burn" }
-burn-store = { path = "/home/mahogny/github/claude/burn/crates/burn-store" }
+# Standardised on mahogny/burn, which carries fixes that published
+# 0.22.0-pre.2 predates.
+burn = { git = "https://github.com/mahogny/burn.git", branch = "main" }
+burn-store = { git = "https://github.com/mahogny/burn.git", branch = "main" }
