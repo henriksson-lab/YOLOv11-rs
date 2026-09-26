@@ -1,5 +1,5 @@
 use burn::prelude::*;
-use burn::tensor::activation::{log_softmax, sigmoid};
+use burn::tensor::activation::{log_sigmoid, log_softmax, sigmoid};
 
 use crate::model::anchors;
 
@@ -56,7 +56,10 @@ pub fn compute_iou(pred: &Tensor<2>, target: &Tensor<2>) -> (Tensor<1>, Tensor<1
 
     let v = ((t_w / t_h).atan() - (p_w / p_h).atan()).powf_scalar(2.0)
         * (4.0 / std::f64::consts::PI.powi(2));
-    let alpha = v.clone() / (v.clone() - iou.clone() + (1.0 + 1e-7));
+    // The reference computes CIoU's alpha under `torch.no_grad()`. Letting
+    // gradients flow through this ratio can explode when its denominator is
+    // small, even though the forward loss is identical.
+    let alpha = (v.clone() / (v.clone() - iou.clone() + (1.0 + 1e-7))).detach();
     let ciou = iou.clone() - (rho2 / c2 + v * alpha);
 
     let n = pred.dims()[0];
@@ -178,7 +181,7 @@ impl Assigner {
             for a in 0..num_anchors {
                 candidates.push((metrics[a][g], a));
             }
-            candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
             for i in 0..top_k {
                 let (_, a) = candidates[i];
                 if is_inside[a][g] {
@@ -194,7 +197,7 @@ impl Assigner {
         for a in 0..num_anchors {
             let mut selected: Vec<usize> = (0..num_gt).filter(|&g| mask_pos[a][g]).collect();
             if selected.len() > 1 {
-                selected.sort_by(|&g1, &g2| overlaps[a][g2].partial_cmp(&overlaps[a][g1]).unwrap());
+                selected.sort_by(|&g1, &g2| overlaps[a][g2].total_cmp(&overlaps[a][g1]));
                 selected.truncate(1);
             }
             if let Some(&g) = selected.first() {
@@ -237,6 +240,229 @@ impl Assigner {
         }
 
         (target_bboxes, target_scores, fg_mask)
+    }
+}
+
+/// Batched task-aligned assignment on the active tensor backend. Assignment
+/// does not require gradients, but keeping it on the device avoids downloading
+/// every anchor prediction and stalling the training stream once per image.
+struct TensorAssigner {
+    top_k: usize,
+    nc: usize,
+    alpha: f64,
+    beta: f64,
+    eps: f64,
+}
+
+impl TensorAssigner {
+    fn new(nc: usize, top_k: usize, alpha: f64, beta: f64, eps: f64) -> Self {
+        Self {
+            top_k,
+            nc,
+            alpha,
+            beta,
+            eps,
+        }
+    }
+
+    fn ciou(gt: Tensor<4>, pred: Tensor<4>) -> Tensor<3> {
+        let gx1 = gt.clone().narrow(3, 0, 1);
+        let gy1 = gt.clone().narrow(3, 1, 1);
+        let gx2 = gt.clone().narrow(3, 2, 1);
+        let gy2 = gt.narrow(3, 3, 1);
+        let px1 = pred.clone().narrow(3, 0, 1);
+        let py1 = pred.clone().narrow(3, 1, 1);
+        let px2 = pred.clone().narrow(3, 2, 1);
+        let py2 = pred.narrow(3, 3, 1);
+
+        let inter = (gx2.clone().min_pair(px2.clone()) - gx1.clone().max_pair(px1.clone()))
+            .clamp_min(0.0)
+            * (gy2.clone().min_pair(py2.clone()) - gy1.clone().max_pair(py1.clone()))
+                .clamp_min(0.0);
+        let gw = gx2.clone() - gx1.clone();
+        let gh = gy2.clone() - gy1.clone() + 1e-7;
+        let pw = px2.clone() - px1.clone();
+        let ph = py2.clone() - py1.clone() + 1e-7;
+        let union = gw.clone() * gh.clone() + pw.clone() * ph.clone() - inter.clone() + 1e-7;
+        let iou = inter / union;
+        let cw = gx2.clone().max_pair(px2.clone()) - gx1.clone().min_pair(px1.clone());
+        let ch = gy2.clone().max_pair(py2.clone()) - gy1.clone().min_pair(py1.clone());
+        let c2 = cw.powf_scalar(2.0) + ch.powf_scalar(2.0) + 1e-7;
+        let rho2 = ((px1.clone() + px2.clone() - gx1.clone() - gx2.clone()).powf_scalar(2.0)
+            + (py1.clone() + py2.clone() - gy1.clone() - gy2.clone()).powf_scalar(2.0))
+            / 4.0;
+        let v = ((pw / ph).atan() - (gw / gh).atan()).powf_scalar(2.0)
+            * (4.0 / std::f64::consts::PI.powi(2));
+        let alpha = v.clone() / (v.clone() - iou.clone() + (1.0 + 1e-7));
+        (iou - (rho2 / c2 + v * alpha))
+            .clamp_min(0.0)
+            .squeeze_dim::<3>(3)
+    }
+
+    fn forward(
+        &self,
+        pd_scores: Tensor<3>,
+        pd_bboxes: Tensor<3>,
+        anc_points: Tensor<2>,
+        gt_labels: Tensor<2, Int>,
+        gt_bboxes: Tensor<3>,
+        mask_gt: Tensor<2, Bool>,
+    ) -> (Tensor<3>, Tensor<3>, Tensor<2, Bool>) {
+        let [batch_size, num_anchors, _] = pd_scores.dims();
+        let num_gt = gt_bboxes.dims()[1];
+        let device = pd_scores.device();
+
+        let anc = anc_points.reshape([1, 1, num_anchors, 2]);
+        let lt = gt_bboxes.clone().narrow(2, 0, 2).unsqueeze_dim::<4>(2);
+        let rb = gt_bboxes.clone().narrow(2, 2, 2).unsqueeze_dim::<4>(2);
+        let inside = Tensor::cat(vec![anc.clone() - lt, rb - anc], 3)
+            .min_dim(3)
+            .squeeze_dim::<3>(3)
+            .greater_elem(self.eps);
+        let valid = inside.bool_and(
+            mask_gt
+                .clone()
+                .unsqueeze_dim::<3>(2)
+                .repeat_dim(2, num_anchors),
+        );
+
+        let label_indices = gt_labels
+            .clone()
+            .unsqueeze_dim::<3>(2)
+            .repeat_dim(2, num_anchors);
+        let bbox_scores =
+            pd_scores.detach().swap_dims(1, 2).gather(1, label_indices) * valid.clone().float();
+        let overlaps = Self::ciou(
+            gt_bboxes.clone().unsqueeze_dim::<4>(2),
+            pd_bboxes.detach().unsqueeze_dim::<4>(1),
+        ) * valid.clone().float();
+        let align_metric =
+            bbox_scores.powf_scalar(self.alpha) * overlaps.clone().powf_scalar(self.beta);
+
+        let k = self.top_k.min(num_anchors);
+        let (_, top_indices) = align_metric.clone().topk_with_indices(k, 2);
+        let top_values = mask_gt
+            .clone()
+            .float()
+            .unsqueeze_dim::<3>(2)
+            .repeat_dim(2, k);
+        let mask_top_k = Tensor::<3>::zeros([batch_size, num_gt, num_anchors], &device).scatter(
+            2,
+            top_indices,
+            top_values,
+            burn::tensor::IndexingUpdateOp::Add,
+        );
+        let mut mask_pos = mask_top_k * valid.clone().float();
+
+        let assignment_profile = std::env::var_os("YOLOV11_ASSIGNMENT_PROFILE").is_some();
+        let valid_per_gt =
+            assignment_profile.then(|| valid.clone().float().sum_dim(2).squeeze_dim::<2>(2));
+        let selected_before_conflict =
+            assignment_profile.then(|| mask_pos.clone().sum_dim(2).squeeze_dim::<2>(2));
+
+        let fg_count = mask_pos.clone().sum_dim(1).squeeze_dim::<2>(1);
+        let multi = fg_count
+            .clone()
+            .greater_elem(1.0)
+            .unsqueeze_dim::<3>(1)
+            .repeat_dim(1, num_gt);
+        let max_overlap_idx = overlaps.clone().argmax(1);
+        let is_max = Tensor::<3>::zeros([batch_size, num_gt, num_anchors], &device).scatter(
+            1,
+            max_overlap_idx,
+            Tensor::ones([batch_size, 1, num_anchors], &device),
+            burn::tensor::IndexingUpdateOp::Add,
+        );
+        mask_pos = mask_pos.mask_where(multi, is_max);
+        if assignment_profile {
+            let valid_gt = mask_gt.clone().to_data().try_to_vec::<bool>().unwrap();
+            let valid_counts = valid_per_gt.unwrap().to_data().try_to_vec::<f32>().unwrap();
+            let pre_counts = selected_before_conflict
+                .unwrap()
+                .to_data()
+                .try_to_vec::<f32>()
+                .unwrap();
+            let post_counts = mask_pos
+                .clone()
+                .sum_dim(2)
+                .squeeze_dim::<2>(2)
+                .to_data()
+                .try_to_vec::<f32>()
+                .unwrap();
+            let contested = fg_count
+                .greater_elem(1.0)
+                .float()
+                .sum()
+                .to_data()
+                .try_to_vec::<f32>()
+                .unwrap()[0] as usize;
+            let mut ground_truth = 0usize;
+            let mut zero_valid = 0usize;
+            let mut zero_selected = 0usize;
+            let mut valid_sum = 0.0f32;
+            let mut pre_sum = 0.0f32;
+            let mut post_sum = 0.0f32;
+            for index in 0..valid_gt.len() {
+                if !valid_gt[index] {
+                    continue;
+                }
+                ground_truth += 1;
+                zero_valid += usize::from(valid_counts[index] == 0.0);
+                zero_selected += usize::from(post_counts[index] == 0.0);
+                valid_sum += valid_counts[index];
+                pre_sum += pre_counts[index];
+                post_sum += post_counts[index];
+            }
+            let denominator = ground_truth.max(1) as f32;
+            eprintln!(
+                "YOLOV11_ASSIGNMENT_PROFILE gt={ground_truth} zero_valid={zero_valid} \
+                 zero_selected={zero_selected} valid_mean={:.3} pre_mean={:.3} \
+                 post_mean={:.3} contested_anchors={contested}",
+                valid_sum / denominator,
+                pre_sum / denominator,
+                post_sum / denominator,
+            );
+        }
+        let fg_mask = mask_pos
+            .clone()
+            .sum_dim(1)
+            .squeeze_dim::<2>(1)
+            .greater_elem(0.0);
+        let target_gt_idx = mask_pos.clone().argmax(1).squeeze_dim::<2>(1);
+
+        let offsets = Tensor::<1, Int>::from_ints(
+            (0..batch_size)
+                .map(|batch| (batch * num_gt) as i32)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            &device,
+        )
+        .reshape([batch_size, 1])
+        .repeat_dim(1, num_anchors);
+        let flat_indices = (target_gt_idx + offsets).reshape([batch_size * num_anchors]);
+        let target_bboxes = gt_bboxes
+            .reshape([batch_size * num_gt, 4])
+            .select(0, flat_indices.clone())
+            .reshape([batch_size, num_anchors, 4]);
+        let target_labels = gt_labels
+            .reshape([batch_size * num_gt])
+            .select(0, flat_indices)
+            .reshape([batch_size, num_anchors]);
+        let target_scores = Tensor::<3>::zeros([batch_size, num_anchors, self.nc], &device)
+            .scatter(
+                2,
+                target_labels.unsqueeze_dim::<3>(2),
+                fg_mask.clone().float().unsqueeze_dim::<3>(2),
+                burn::tensor::IndexingUpdateOp::Add,
+            );
+
+        let masked_metric = align_metric * mask_pos.clone();
+        let pos_align = masked_metric.clone().max_dim(2);
+        let pos_overlap = (overlaps * mask_pos).max_dim(2);
+        let norm = (masked_metric * pos_overlap / (pos_align + self.eps))
+            .max_dim(1)
+            .swap_dims(1, 2);
+        (target_bboxes, target_scores * norm, fg_mask)
     }
 }
 
@@ -317,38 +543,25 @@ impl BoxLoss {
         pred_dist: &Tensor<2>,
         target: &Tensor<2>,
         ch: usize,
-        device: &Device,
+        _device: &Device,
     ) -> Tensor<1> {
-        let target_flat: Vec<f32> = target
-            .clone()
-            .reshape([target.dims()[0] * 4])
-            .to_data()
-            .try_to_vec::<f32>()
-            .unwrap();
         let n = pred_dist.dims()[0];
-
-        let target_left: Vec<f32> = target_flat.iter().map(|&v| v.floor()).collect();
-        let target_right: Vec<f32> = target_left.iter().map(|&v| v + 1.0).collect();
-        let weight_right: Vec<f32> = target_flat
-            .iter()
-            .zip(target_left.iter())
-            .map(|(&t, &l)| t - l)
-            .collect();
-        let weight_left: Vec<f32> = weight_right.iter().map(|&wr| 1.0 - wr).collect();
-
+        let target = target.clone().reshape([n * 4]);
+        let target_left = target.clone().floor();
+        let weight_right = target - target_left.clone();
+        let weight_left = weight_right.clone().neg() + 1.0;
+        let left_indices = target_left.clone().int().reshape([n * 4, 1]);
+        let right_indices = (target_left + 1.0).int().reshape([n * 4, 1]);
         let pd = pred_dist.clone().reshape([n * 4, ch]);
         let log_sm = log_softmax(pd, 1);
-        let log_sm_data: Vec<f32> = log_sm.to_data().try_to_vec::<f32>().unwrap();
-
-        let mut loss_vals = Vec::with_capacity(n * 4);
-        for i in 0..n * 4 {
-            let row_start = i * ch;
-            let ll = -log_sm_data[row_start + target_left[i] as usize] * weight_left[i];
-            let lr = -log_sm_data[row_start + target_right[i] as usize] * weight_right[i];
-            loss_vals.push(ll + lr);
-        }
-
-        let loss = Tensor::<1>::from_floats(loss_vals.as_slice(), device).reshape([n, 4]);
+        let loss = (log_sm
+            .clone()
+            .gather(1, left_indices)
+            .reshape([n * 4])
+            .neg()
+            * weight_left
+            + log_sm.gather(1, right_indices).reshape([n * 4]).neg() * weight_right)
+            .reshape([n, 4]);
         loss.mean_dim(1).reshape([n])
     }
 }
@@ -363,8 +576,8 @@ impl QFL {
     }
 
     pub fn forward(&self, outputs: &Tensor<2>, targets: &Tensor<2>) -> Tensor<2> {
-        let bce_loss = outputs.clone().clamp_min(0.0) - outputs.clone() * targets.clone()
-            + (outputs.clone().abs().neg().exp() + 1.0).log();
+        let bce_loss =
+            (targets.clone().neg() + 1.0) * outputs.clone() - log_sigmoid(outputs.clone());
         (targets.clone() - sigmoid(outputs.clone()))
             .abs()
             .powf_scalar(self.beta)
@@ -388,8 +601,7 @@ impl VFL {
     }
 
     pub fn forward(&self, outputs: &Tensor<2>, targets: &Tensor<2>) -> Tensor<2> {
-        let loss = outputs.clone().clamp_min(0.0) - outputs.clone() * targets.clone()
-            + (outputs.clone().abs().neg().exp() + 1.0).log();
+        let loss = (targets.clone().neg() + 1.0) * outputs.clone() - log_sigmoid(outputs.clone());
         let distance = (sigmoid(outputs.clone()) - targets.clone())
             .abs()
             .powf_scalar(self.gamma);
@@ -418,8 +630,8 @@ impl FocalLoss {
     }
 
     pub fn forward(&self, outputs: &Tensor<2>, targets: &Tensor<2>) -> Tensor<2> {
-        let mut loss = outputs.clone().clamp_min(0.0) - outputs.clone() * targets.clone()
-            + (outputs.clone().abs().neg().exp() + 1.0).log();
+        let mut loss =
+            (targets.clone().neg() + 1.0) * outputs.clone() - log_sigmoid(outputs.clone());
         if self.alpha > 0.0 {
             let alpha_factor =
                 targets.clone() * self.alpha + (1.0 - targets.clone()) * (1.0 - self.alpha);
@@ -510,10 +722,6 @@ impl ComputeLoss {
         let target_box_xyxy = anchors::wh2xy(target_box);
         let target_box_pixel = target_box_xyxy * (img_size as f32);
 
-        let mut total_box_loss = Tensor::<1>::zeros([1], device);
-        let mut total_cls_loss = Tensor::<1>::zeros([1], device);
-        let mut total_dfl_loss = Tensor::<1>::zeros([1], device);
-
         let target_idx_vec: Vec<f32> = target_idx.to_data().try_to_vec::<f32>().unwrap();
 
         let target_cls_vec: Vec<f32> = target_cls
@@ -528,7 +736,6 @@ impl ComputeLoss {
             .enumerate()
             .filter_map(|(i, &idx)| if idx >= 0.0 { Some(i) } else { None })
             .collect();
-        let num_targets = valid_target_indices.len();
         let target_idx_vec: Vec<f32> = valid_target_indices
             .iter()
             .map(|&i| target_idx_vec[i])
@@ -557,112 +764,102 @@ impl ComputeLoss {
         // assigned and the model learns to predict nothing. Python does the
         // same multiplication (`anchor_points * stride_tensor`) at the same
         // point.
+        let mut per_batch = vec![Vec::<usize>::new(); batch_size];
+        for (target, &batch) in target_idx_vec.iter().enumerate() {
+            per_batch[batch as usize].push(target);
+        }
+        let max_gt = per_batch.iter().map(Vec::len).max().unwrap_or(0).max(1);
+        let mut padded_labels = vec![0i32; batch_size * max_gt];
+        let mut padded_boxes = vec![0.0f32; batch_size * max_gt * 4];
+        let mut padded_mask = vec![false; batch_size * max_gt];
+        for (batch, targets) in per_batch.iter().enumerate() {
+            for (slot, &target) in targets.iter().enumerate() {
+                let output = batch * max_gt + slot;
+                padded_labels[output] = target_cls_vec[target] as i32;
+                padded_boxes[output * 4..output * 4 + 4].copy_from_slice(&target_box_vec[target]);
+                padded_mask[output] = true;
+            }
+        }
+        let gt_labels = Tensor::<1, Int>::from_ints(padded_labels.as_slice(), device)
+            .reshape([batch_size, max_gt]);
+        let gt_bboxes = Tensor::<1>::from_floats(padded_boxes.as_slice(), device)
+            .reshape([batch_size, max_gt, 4]);
+        let mask_gt = Tensor::<1, Bool>::from_bool(padded_mask.as_slice(), device)
+            .reshape([batch_size, max_gt]);
+
         let anchor_points_pixel = anchor_points.clone() * strides.clone();
-        let anc_data: Vec<f32> = anchor_points_pixel.to_data().try_to_vec::<f32>().unwrap();
-        let anc_vec: Vec<[f32; 2]> = (0..total_a)
-            .map(|i| [anc_data[i * 2], anc_data[i * 2 + 1]])
-            .collect();
-
-        let assigner = Assigner::new(self.nc, 10, 0.5, 6.0, 1e-9);
-        let mut assigned = Vec::with_capacity(batch_size);
-        let mut target_scores_sum = 0.0f32;
-
-        for b in 0..batch_size {
-            let mut gt_labels = Vec::new();
-            let mut gt_bboxes = Vec::new();
-            for t in 0..num_targets {
-                if target_idx_vec[t] as usize == b {
-                    gt_labels.push(target_cls_vec[t] as i64);
-                    gt_bboxes.push(target_box_vec[t]);
-                }
-            }
-
-            let pb = pred_bboxes.clone().narrow(0, b, 1).squeeze_dim::<2>(0); // [A, 4] anchor units
-            let ps = pred_scores_t.clone().narrow(0, b, 1).squeeze_dim::<2>(0); // [A, nc]
-            let ps_sigmoid = sigmoid(ps.clone());
-
-            let ps_data: Vec<f32> = ps_sigmoid.to_data().try_to_vec::<f32>().unwrap();
-            let ps_vec: Vec<Vec<f32>> = (0..total_a)
-                .map(|i| {
-                    let start = i * self.nc;
-                    ps_data[start..start + self.nc].to_vec()
-                })
-                .collect();
-
-            let pb_pixel = pb.clone() * strides.clone();
-            let pb_data: Vec<f32> = pb_pixel.to_data().try_to_vec::<f32>().unwrap();
-            let pb_vec: Vec<[f32; 4]> = (0..total_a)
-                .map(|i| {
-                    [
-                        pb_data[i * 4],
-                        pb_data[i * 4 + 1],
-                        pb_data[i * 4 + 2],
-                        pb_data[i * 4 + 3],
-                    ]
-                })
-                .collect();
-
-            let (target_bboxes, target_scores, fg_mask) =
-                assigner.forward(&ps_vec, &pb_vec, &anc_vec, &gt_labels, &gt_bboxes);
-            target_scores_sum += target_scores.iter().flatten().sum::<f32>();
-            assigned.push((target_bboxes, target_scores, fg_mask));
-        }
-
-        let target_scores_sum = target_scores_sum.max(1.0);
-
-        for (b, (target_bboxes, target_scores, fg_mask)) in assigned.iter().enumerate() {
-            let pb = pred_bboxes.clone().narrow(0, b, 1).squeeze_dim::<2>(0);
-            let ps = pred_scores_t.clone().narrow(0, b, 1).squeeze_dim::<2>(0);
-
-            let fg_count: usize = fg_mask.iter().filter(|&&v| v).count();
-
-            let cls_target_data: Vec<f32> = target_scores.iter().flatten().copied().collect();
-            let cls_target = Tensor::<1>::from_floats(cls_target_data.as_slice(), device)
-                .reshape([total_a, self.nc]);
-            let cls_loss = (ps.clone().clamp_min(0.0) - ps.clone() * cls_target.clone()
-                + (ps.clone().abs().neg().exp() + 1.0).log())
-            .sum_dim(1)
-            .sum_dim(0)
-            .reshape([1])
-                / target_scores_sum as f64;
-            total_cls_loss = total_cls_loss + cls_loss;
-
-            if fg_count == 0 {
-                continue;
-            }
-
-            let pred_dist_b = pred_dist.clone().narrow(0, b, 1).squeeze_dim::<2>(0); // [4*ch, A]
-            let pred_dist_b = pred_dist_b.swap_dims(0, 1); // [A, 4*ch]
-            let strides_data: Vec<f32> = strides.to_data().try_to_vec::<f32>().unwrap();
-
-            let target_bboxes_data: Vec<f32> = (0..total_a)
-                .flat_map(|a| {
-                    let stride = strides_data[a];
-                    [
-                        target_bboxes[a][0] / stride,
-                        target_bboxes[a][1] / stride,
-                        target_bboxes[a][2] / stride,
-                        target_bboxes[a][3] / stride,
-                    ]
-                })
-                .collect();
-            let target_bboxes_tensor =
-                Tensor::<1>::from_floats(target_bboxes_data.as_slice(), device)
-                    .reshape([total_a, 4]);
-
-            let (box_loss, dfl_loss) = BoxLoss::new(self.ch - 1).forward(
-                &pred_dist_b,
-                &pb,
-                &anchor_points,
-                &target_bboxes_tensor,
-                &cls_target,
-                target_scores_sum,
-                &fg_mask,
-                device,
+        let pred_bboxes_pixel = pred_bboxes.clone() * strides.clone().unsqueeze_dim::<3>(0);
+        let (target_bboxes, target_scores, fg_mask) =
+            TensorAssigner::new(self.nc, 10, 0.5, 6.0, 1e-9).forward(
+                // The PyTorch task-aligned assigner runs under `no_grad`.
+                // Assignment chooses fixed targets for this optimization step;
+                // differentiating through its scores changes, and can reverse,
+                // the classification and box gradients.
+                sigmoid(pred_scores_t.clone()).detach(),
+                pred_bboxes_pixel.detach(),
+                anchor_points_pixel,
+                gt_labels,
+                gt_bboxes,
+                mask_gt,
             );
-            total_box_loss = total_box_loss + box_loss;
-            total_dfl_loss = total_dfl_loss + dfl_loss;
-        }
+        let target_scores_sum = target_scores.clone().sum().reshape([1]).clamp_min(1.0);
+
+        let total_cls_loss = ((target_scores.clone().neg() + 1.0) * pred_scores_t.clone()
+            - log_sigmoid(pred_scores_t.clone()))
+        .sum()
+        .reshape([1])
+            / target_scores_sum.clone();
+
+        let target_bboxes_grid = target_bboxes / strides.clone().unsqueeze_dim::<3>(0);
+        let flat_fg = fg_mask.reshape([batch_size * total_a]);
+        let fg_indices = flat_fg.nonzero().into_iter().next();
+        let (total_box_loss, total_dfl_loss) = if let Some(fg_indices) = fg_indices {
+            let fg_count = fg_indices.dims()[0];
+            let weights = target_scores
+                .clone()
+                .sum_dim(2)
+                .reshape([batch_size * total_a])
+                .select(0, fg_indices.clone())
+                .reshape([fg_count, 1]);
+            let pred_bboxes_fg = pred_bboxes
+                .clone()
+                .reshape([batch_size * total_a, 4])
+                .select(0, fg_indices.clone());
+            let target_bboxes_fg = target_bboxes_grid
+                .clone()
+                .reshape([batch_size * total_a, 4])
+                .select(0, fg_indices.clone());
+            let (ciou, _) = compute_iou(&pred_bboxes_fg, &target_bboxes_fg);
+            let box_loss = ((ciou.neg() + 1.0).reshape([fg_count, 1]) * weights.clone())
+                .sum()
+                .reshape([1])
+                / target_scores_sum.clone();
+
+            let anchors = anchor_points
+                .reshape([1, total_a, 2])
+                .repeat_dim(0, batch_size);
+            let target_fg = Tensor::cat(
+                vec![
+                    anchors.clone() - target_bboxes_grid.clone().narrow(2, 0, 2),
+                    target_bboxes_grid.narrow(2, 2, 2) - anchors,
+                ],
+                2,
+            )
+            .clamp(0.0, self.ch as f64 - 1.01)
+            .reshape([batch_size * total_a, 4])
+            .select(0, fg_indices.clone());
+            let pred_dist_fg = pred_dist
+                .swap_dims(1, 2)
+                .reshape([batch_size * total_a, self.ch * 4])
+                .select(0, fg_indices);
+            let dfl =
+                BoxLoss::df_loss(&pred_dist_fg, &target_fg, self.ch, device).reshape([fg_count, 1]);
+            let dfl_loss = (dfl * weights).sum().reshape([1]) / target_scores_sum;
+            (box_loss, dfl_loss)
+        } else {
+            let zero = Tensor::<1>::zeros([1], device);
+            (zero.clone(), zero)
+        };
 
         let loss_box = total_box_loss * self.box_gain;
         let loss_cls = total_cls_loss * self.cls_gain;
@@ -734,10 +931,8 @@ mod tests {
     #[test]
     fn compute_iou_matches_python_ciou_formula() {
         let device = burn::tensor::Device::flex();
-        let pred =
-            Tensor::<1>::from_floats([0.0, 0.0, 2.0, 3.0], &device).reshape([1, 4]);
-        let target =
-            Tensor::<1>::from_floats([0.5, 0.25, 2.5, 2.0], &device).reshape([1, 4]);
+        let pred = Tensor::<1>::from_floats([0.0, 0.0, 2.0, 3.0], &device).reshape([1, 4]);
+        let target = Tensor::<1>::from_floats([0.5, 0.25, 2.5, 2.0], &device).reshape([1, 4]);
 
         let (ciou, iou) = compute_iou(&pred, &target);
         let ciou = ciou.to_data().try_to_vec::<f32>().unwrap()[0];
@@ -870,10 +1065,8 @@ mod tests {
     #[test]
     fn vfl_matches_python_positive_negative_weighting() {
         let device = burn::tensor::Device::flex();
-        let outputs =
-            Tensor::<1>::from_floats([0.0, 0.0, 0.0], &device).reshape([1, 3]);
-        let targets =
-            Tensor::<1>::from_floats([1.0, 0.0, 0.4], &device).reshape([1, 3]);
+        let outputs = Tensor::<1>::from_floats([0.0, 0.0, 0.0], &device).reshape([1, 3]);
+        let targets = Tensor::<1>::from_floats([1.0, 0.0, 0.4], &device).reshape([1, 3]);
         let loss = super::VFL::new(0.75, 2.0, true).forward(&outputs, &targets);
         let loss = loss.to_data().try_to_vec::<f32>().unwrap();
 
@@ -888,11 +1081,9 @@ mod tests {
     fn qfl_and_focal_loss_match_python_fixture() {
         let device = burn::tensor::Device::flex();
         let outputs =
-            Tensor::<1>::from_floats([-2.0, 0.0, 1.5, 3.0, -1.0, 0.25], &device)
-                .reshape([2, 3]);
+            Tensor::<1>::from_floats([-2.0, 0.0, 1.5, 3.0, -1.0, 0.25], &device).reshape([2, 3]);
         let targets =
-            Tensor::<1>::from_floats([0.0, 1.0, 0.4, 1.0, 0.0, 0.75], &device)
-                .reshape([2, 3]);
+            Tensor::<1>::from_floats([0.0, 1.0, 0.4, 1.0, 0.0, 0.75], &device).reshape([2, 3]);
 
         let qfl = super::QFL::new(2.0)
             .forward(&outputs, &targets)
@@ -958,11 +1149,8 @@ mod tests {
             &device,
         )
         .reshape([2, 16]);
-        let target = Tensor::<1>::from_floats(
-            [0.2, 1.7, 2.4, 2.99, 0.0, 0.5, 1.2, 2.8],
-            &device,
-        )
-        .reshape([2, 4]);
+        let target = Tensor::<1>::from_floats([0.2, 1.7, 2.4, 2.99, 0.0, 0.5, 1.2, 2.8], &device)
+            .reshape([2, 4]);
 
         let loss = super::BoxLoss::df_loss(&pred_dist, &target, 4, &device)
             .to_data()
@@ -980,8 +1168,7 @@ mod tests {
     fn box_loss_df_loss_out_of_range_target_matches_python_index_error() {
         let device = burn::tensor::Device::flex();
         let pred_dist = Tensor::<1>::from_floats([0.0; 4], &device).reshape([1, 4]);
-        let target =
-            Tensor::<1>::from_floats([3.0, 0.0, 0.0, 0.0], &device).reshape([1, 4]);
+        let target = Tensor::<1>::from_floats([3.0, 0.0, 0.0, 0.0], &device).reshape([1, 4]);
 
         let _ = super::BoxLoss::df_loss(&pred_dist, &target, 4, &device);
     }
@@ -1007,8 +1194,7 @@ mod tests {
             &device,
         )
         .reshape([1, 16, 2]);
-        let anchor_points =
-            Tensor::<1>::from_floats([2.5, 3.5, 6.0, 1.0], &device).reshape([2, 2]);
+        let anchor_points = Tensor::<1>::from_floats([2.5, 3.5, 6.0, 1.0], &device).reshape([2, 2]);
         let strides = Tensor::<1>::from_floats([8.0, 8.0], &device).reshape([2, 1]);
 
         let decoded = loss
@@ -1030,20 +1216,14 @@ mod tests {
         let device = burn::tensor::Device::flex();
         let box_loss = super::BoxLoss::new(3);
         let pred_dist = Tensor::<1>::from_floats([0.0; 32], &device).reshape([2, 16]);
-        let pred_bboxes = Tensor::<1>::from_floats(
-            [0.0, 0.0, 2.0, 2.0, 2.0, 2.0, 4.0, 4.0],
-            &device,
-        )
-        .reshape([2, 4]);
-        let anchor_points =
-            Tensor::<1>::from_floats([1.0, 1.0, 3.0, 3.0], &device).reshape([2, 2]);
-        let target_bboxes = Tensor::<1>::from_floats(
-            [0.0, 0.0, 2.0, 2.0, 2.0, 2.0, 4.0, 4.0],
-            &device,
-        )
-        .reshape([2, 4]);
-        let target_scores =
-            Tensor::<1>::from_floats([0.5, 0.0], &device).reshape([2, 1]);
+        let pred_bboxes =
+            Tensor::<1>::from_floats([0.0, 0.0, 2.0, 2.0, 2.0, 2.0, 4.0, 4.0], &device)
+                .reshape([2, 4]);
+        let anchor_points = Tensor::<1>::from_floats([1.0, 1.0, 3.0, 3.0], &device).reshape([2, 2]);
+        let target_bboxes =
+            Tensor::<1>::from_floats([0.0, 0.0, 2.0, 2.0, 2.0, 2.0, 4.0, 4.0], &device)
+                .reshape([2, 4]);
+        let target_scores = Tensor::<1>::from_floats([0.5, 0.0], &device).reshape([2, 1]);
 
         let (loss_box, loss_dfl) = box_loss.forward(
             &pred_dist,
@@ -1095,11 +1275,9 @@ mod tests {
         let device = burn::tensor::Device::flex();
         let stride = Tensor::<1>::from_floats([8.0], &device);
         let loss = ComputeLoss::new(1, 1, &stride, 7.5, 0.5, 1.5);
-        let outputs =
-            vec![Tensor::<1>::zeros([65 * 4 * 4], &device).reshape([1, 65, 4, 4])];
+        let outputs = vec![Tensor::<1>::zeros([65 * 4 * 4], &device).reshape([1, 65, 4, 4])];
         let target_cls = Tensor::<1>::zeros([1], &device).reshape([1, 1]);
-        let target_box =
-            Tensor::<1>::from_floats([0.5, 0.5, 1.0, 1.0], &device).reshape([1, 4]);
+        let target_box = Tensor::<1>::from_floats([0.5, 0.5, 1.0, 1.0], &device).reshape([1, 4]);
         let target_idx = Tensor::<1>::from_floats([0.0], &device);
 
         let (loss_box, loss_cls, loss_dfl) = loss.call(
@@ -1144,8 +1322,15 @@ mod tests {
         let target_box = Tensor::<1>::from_floats([0.5, 0.5, 0.1, 0.1], &device).reshape([1, 4]);
         let target_idx = Tensor::<1>::from_floats([0.0], &device);
 
-        let (loss_box, _loss_cls, loss_dfl) =
-            loss.call(&outputs, &target_cls, &target_box, &target_idx, 1, 320, &device);
+        let (loss_box, _loss_cls, loss_dfl) = loss.call(
+            &outputs,
+            &target_cls,
+            &target_box,
+            &target_idx,
+            1,
+            320,
+            &device,
+        );
 
         // Box and DFL losses are computed only over assigned anchors, so a
         // non-zero value here is the assertion that anything was assigned.
@@ -1167,11 +1352,9 @@ mod tests {
         let stride = Tensor::<1>::from_floats([8.0], &device);
         let loss = ComputeLoss::new(1, 1, &stride, 1.0, 1.0, 1.0);
 
-        let single_outputs =
-            vec![Tensor::<1>::zeros([65 * 8 * 8], &device).reshape([1, 65, 8, 8])];
+        let single_outputs = vec![Tensor::<1>::zeros([65 * 8 * 8], &device).reshape([1, 65, 8, 8])];
         let single_cls = Tensor::<1>::zeros([1], &device).reshape([1, 1]);
-        let single_box =
-            Tensor::<1>::from_floats([0.5, 0.5, 1.0, 1.0], &device).reshape([1, 4]);
+        let single_box = Tensor::<1>::from_floats([0.5, 0.5, 1.0, 1.0], &device).reshape([1, 4]);
         let single_idx = Tensor::<1>::from_floats([0.0], &device);
         let single_losses = loss.call(
             &single_outputs,
@@ -1186,11 +1369,8 @@ mod tests {
         let batch_outputs =
             vec![Tensor::<1>::zeros([2 * 65 * 8 * 8], &device).reshape([2, 65, 8, 8])];
         let batch_cls = Tensor::<1>::zeros([2], &device).reshape([2, 1]);
-        let batch_box = Tensor::<1>::from_floats(
-            [0.5, 0.5, 1.0, 1.0, 0.5, 0.5, 1.0, 1.0],
-            &device,
-        )
-        .reshape([2, 4]);
+        let batch_box = Tensor::<1>::from_floats([0.5, 0.5, 1.0, 1.0, 0.5, 0.5, 1.0, 1.0], &device)
+            .reshape([2, 4]);
         let batch_idx = Tensor::<1>::from_floats([0.0, 1.0], &device);
         let batch_losses = loss.call(
             &batch_outputs,

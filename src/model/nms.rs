@@ -1,6 +1,24 @@
 /// Non-maximum suppression on CPU.
 use burn::prelude::*;
-use std::time::Instant;
+
+#[derive(Clone, Copy, Debug)]
+pub struct NmsOptions {
+    pub confidence_threshold: f32,
+    pub iou_threshold: f32,
+    pub max_detections: usize,
+    pub max_candidates: usize,
+}
+
+impl Default for NmsOptions {
+    fn default() -> Self {
+        Self {
+            confidence_threshold: 0.25,
+            iou_threshold: 0.45,
+            max_detections: 300,
+            max_candidates: 30_000,
+        }
+    }
+}
 
 /// Apply NMS to model outputs in Python's `[B, 4 + nc, A]` layout.
 pub fn non_max_suppression(
@@ -8,13 +26,28 @@ pub fn non_max_suppression(
     confidence_threshold: f32,
     iou_threshold: f32,
 ) -> Vec<Vec<[f32; 6]>> {
+    non_max_suppression_with_options(
+        outputs,
+        NmsOptions {
+            confidence_threshold,
+            iou_threshold,
+            ..NmsOptions::default()
+        },
+    )
+}
+
+/// Apply NMS with explicit candidate and output limits.
+///
+/// Every image in the batch is always processed. A wall-clock deadline would
+/// make metrics depend on batch ordering and host load, and can silently turn
+/// unprocessed images into false negatives.
+pub fn non_max_suppression_with_options(
+    outputs: &Tensor<3>,
+    options: NmsOptions,
+) -> Vec<Vec<[f32; 6]>> {
     const MAX_WH: f32 = 7680.0;
-    const MAX_DET: usize = 300;
-    const MAX_NMS: usize = 30_000;
 
     let [batch, stride, num_anchors] = outputs.dims();
-    let start = Instant::now();
-    let limit_seconds = 0.5 + 0.05 * batch as f32;
     let mut output = vec![Vec::new(); batch];
 
     for index in 0..batch {
@@ -29,7 +62,10 @@ pub fn non_max_suppression(
         for i in 0..num_anchors {
             let base = i * stride;
             let cls_scores = &preds[base + 4..base + stride];
-            if !cls_scores.iter().any(|&score| score > confidence_threshold) {
+            if !cls_scores
+                .iter()
+                .any(|&score| score > options.confidence_threshold)
+            {
                 continue;
             }
 
@@ -44,13 +80,13 @@ pub fn non_max_suppression(
 
             if cls_scores.len() > 1 {
                 for (class, &confidence) in cls_scores.iter().enumerate() {
-                    if confidence > confidence_threshold {
+                    if confidence > options.confidence_threshold {
                         candidates.push([x1, y1, x2, y2, confidence, class as f32]);
                     }
                 }
             } else {
                 let confidence = cls_scores[0];
-                if confidence > confidence_threshold {
+                if confidence > options.confidence_threshold {
                     candidates.push([x1, y1, x2, y2, confidence, 0.0]);
                 }
             }
@@ -61,15 +97,15 @@ pub fn non_max_suppression(
         }
 
         candidates.sort_unstable_by(|a, b| b[4].partial_cmp(&a[4]).unwrap());
-        candidates.truncate(MAX_NMS);
+        candidates.truncate(options.max_candidates);
 
         let mut suppressed = vec![false; candidates.len()];
-        let mut keep: Vec<[f32; 6]> = Vec::with_capacity(MAX_DET);
+        let mut keep: Vec<[f32; 6]> = Vec::with_capacity(options.max_detections);
         for i in 0..candidates.len() {
             if suppressed[i] {
                 continue;
             }
-            if keep.len() >= MAX_DET {
+            if keep.len() >= options.max_detections {
                 break;
             }
 
@@ -91,7 +127,7 @@ pub fn non_max_suppression(
                     (candidates[j][2] - candidates[j][0]) * (candidates[j][3] - candidates[j][1]);
                 let union = area_i + area_j - inter;
                 let iou = if union > 0.0 { inter / union } else { 0.0 };
-                if iou > iou_threshold {
+                if iou > options.iou_threshold {
                     suppressed[j] = true;
                 }
             }
@@ -100,9 +136,6 @@ pub fn non_max_suppression(
         }
 
         output[index] = keep;
-        if start.elapsed().as_secs_f32() > limit_seconds {
-            break;
-        }
     }
 
     output
@@ -110,7 +143,7 @@ pub fn non_max_suppression(
 
 #[cfg(test)]
 mod tests {
-    use super::non_max_suppression;
+    use super::{non_max_suppression, non_max_suppression_with_options, NmsOptions};
     use burn::prelude::*;
 
     fn outputs(anchor_major: &[f32], stride: usize, num_anchors: usize) -> Tensor<3> {
@@ -147,6 +180,26 @@ mod tests {
         assert_eq!(detections.len(), 2);
         assert!(detections.iter().any(|d| d[5] == 0.0 && d[4] == 0.8));
         assert!(detections.iter().any(|d| d[5] == 1.0 && d[4] == 0.7));
+    }
+
+    #[test]
+    fn explicit_detection_limit_supports_dense_images() {
+        let preds = [
+            10.0, 10.0, 2.0, 2.0, 0.9, //
+            20.0, 20.0, 2.0, 2.0, 0.8, //
+            30.0, 30.0, 2.0, 2.0, 0.7,
+        ];
+        let detections = non_max_suppression_with_options(
+            &outputs(&preds, 5, 3),
+            NmsOptions {
+                confidence_threshold: 0.5,
+                iou_threshold: 0.65,
+                max_detections: 2,
+                max_candidates: 30_000,
+            },
+        );
+
+        assert_eq!(detections[0].len(), 2);
     }
 
     #[test]

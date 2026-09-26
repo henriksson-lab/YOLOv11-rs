@@ -3,6 +3,20 @@ use burn::module::Param;
 use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::nn::{BatchNorm, BatchNormConfig};
 use burn::prelude::*;
+use std::cell::Cell;
+
+thread_local! {
+    static FROZEN_BATCH_NORM: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn with_frozen_batch_norm<T>(frozen: bool, operation: impl FnOnce() -> T) -> T {
+    FROZEN_BATCH_NORM.with(|state| {
+        let previous = state.replace(frozen);
+        let result = operation();
+        state.set(previous);
+        result
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Activation {
@@ -25,8 +39,11 @@ pub fn fuse_conv(conv: Conv2d, norm: BatchNorm) -> Conv2d {
         None => Tensor::<1>::zeros([out_ch], &device),
     };
 
-    let fused_weight = conv.weight.val() * scale.clone().reshape([out_ch, 1, 1, 1]);
-    let fused_bias = beta + (conv_bias - running_mean) * scale;
+    // Folding is a model transformation. The resulting values must become new
+    // trainable parameter leaves rather than retaining the temporary folding
+    // graph.
+    let fused_weight = (conv.weight.val() * scale.clone().reshape([out_ch, 1, 1, 1])).detach();
+    let fused_bias = (beta + (conv_bias - running_mean) * scale).detach();
 
     let mut fused = Conv2dConfig::new(
         [conv.weight.dims()[1] * conv.groups, out_ch],
@@ -87,7 +104,11 @@ impl Conv {
     pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
         let x = self.conv.forward(x);
         let x = if let Some(ref norm) = self.norm {
-            norm.forward::<4>(x)
+            if FROZEN_BATCH_NORM.with(Cell::get) {
+                norm.forward_inference::<4>(x)
+            } else {
+                norm.forward::<4>(x)
+            }
         } else {
             x
         };
@@ -122,7 +143,7 @@ impl FuseModule for Conv {
 
 #[cfg(test)]
 mod tests {
-    use super::fuse_conv;
+    use super::{fuse_conv, with_frozen_batch_norm, Activation, Conv};
     use burn::module::{Param, RunningState};
     use burn::nn::conv::Conv2dConfig;
     use burn::nn::BatchNormConfig;
@@ -140,17 +161,11 @@ mod tests {
             Tensor::<1>::from_floats([2.0, -3.0], &device).reshape([2, 1, 1, 1]),
         );
 
-        let mut norm = BatchNormConfig::new(2)
-            .with_epsilon(0.001)
-            .init(&device);
-        norm.gamma =
-            Param::from_tensor(Tensor::<1>::from_floats([1.5, -2.0], &device));
-        norm.beta =
-            Param::from_tensor(Tensor::<1>::from_floats([0.25, 0.75], &device));
-        norm.running_mean =
-            RunningState::new(Tensor::<1>::from_floats([0.5, -1.0], &device));
-        norm.running_var =
-            RunningState::new(Tensor::<1>::from_floats([4.0, 0.25], &device));
+        let mut norm = BatchNormConfig::new(2).with_epsilon(0.001).init(&device);
+        norm.gamma = Param::from_tensor(Tensor::<1>::from_floats([1.5, -2.0], &device));
+        norm.beta = Param::from_tensor(Tensor::<1>::from_floats([0.25, 0.75], &device));
+        norm.running_mean = RunningState::new(Tensor::<1>::from_floats([0.5, -1.0], &device));
+        norm.running_var = RunningState::new(Tensor::<1>::from_floats([4.0, 0.25], &device));
 
         let fused = fuse_conv(conv, norm);
         let weight = fused.weight.val().to_data().try_to_vec::<f32>().unwrap();
@@ -180,5 +195,31 @@ mod tests {
                 "bias actual={actual} expected={expected}"
             );
         }
+    }
+
+    #[test]
+    fn frozen_batch_norm_uses_running_statistics_without_updating_them() {
+        let device = Device::flex().autodiff();
+        let conv = Conv::new(1, 1, Activation::Identity, 1, 1, 0, 1, &device);
+        let input = Tensor::<4>::ones([2, 1, 4, 4], &device);
+        let before = conv
+            .norm
+            .as_ref()
+            .unwrap()
+            .running_mean
+            .value_sync()
+            .to_data();
+
+        let output = with_frozen_batch_norm(true, || conv.forward(input));
+        let _gradients = output.sum().backward();
+        let after = conv
+            .norm
+            .as_ref()
+            .unwrap()
+            .running_mean
+            .value_sync()
+            .to_data();
+
+        assert_eq!(before, after);
     }
 }

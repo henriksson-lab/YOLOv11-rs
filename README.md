@@ -4,6 +4,7 @@ YOLOv11 object detection implemented in Rust using the [Candle](https://github.c
 
 Based on the PyTorch re-implementation in [YOLOv11-pt](https://github.com/jahongir7174/YOLOv11-pt).
 
+* 2026-09-26: Work on improving training etc
 * 2026-08-23: Update to latest Burn. Currently linked my own fork; will fix once PRs accepted
 * 2026-07-03: File-by-file audit done. Seems promising but need to update my CUDA and do deeper testing
 

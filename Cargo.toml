@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = []
 cuda = ["burn/cuda"]
+libtorch = ["burn/tch"]
 
 [dependencies]
 burn = { version = "0.22.0-pre.2", features = ["optim", "wgpu", "flex"] }
@@ -13,6 +14,7 @@ burn-store = { version = "0.22.0-pre.2", default-features = false, features = ["
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+serde_json = "1"
 image = "0.25"
 rand = "0.8"
 rand_distr = "0.4"
@@ -26,5 +28,5 @@ zune-jpeg = "0.5"
 [patch.crates-io]
 # Standardised on mahogny/burn, which carries fixes that published
 # 0.22.0-pre.2 predates.
-burn = { git = "https://github.com/mahogny/burn.git", branch = "main" }
-burn-store = { git = "https://github.com/mahogny/burn.git", branch = "main" }
+burn = { path = "../burn/crates/burn" }
+burn-store = { path = "../burn/crates/burn-store" }

@@ -1,14 +1,29 @@
 use anyhow::Result;
 use burn::prelude::*;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "libtorch"))]
 use burn::tensor::DeviceIndex;
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(any(feature = "cuda", feature = "libtorch")))]
 use burn::tensor::DeviceKind;
 use clap::{Parser, Subcommand};
 
 use yolov11::data;
 use yolov11::model;
 use yolov11::train;
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum GeometryArg {
+    None,
+    D4,
+}
+
+impl From<GeometryArg> for data::source::GeometryPolicy {
+    fn from(value: GeometryArg) -> Self {
+        match value {
+            GeometryArg::None => Self::None,
+            GeometryArg::D4 => Self::D4,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "yolov11", about = "YOLOv11 training and evaluation in Rust")]
@@ -41,14 +56,42 @@ enum Command {
         #[arg(long, default_value_t = 600)]
         epochs: usize,
 
+        /// Total learning-rate schedule horizon. Set when starting a staged run.
+        #[arg(long)]
+        schedule_epochs: Option<usize>,
+
         /// Evaluate every N epochs (1 = every epoch). Validation is the
         /// expensive phase on a small dataset; the last epoch always evaluates.
         #[arg(long, default_value_t = 1)]
         eval_interval: usize,
 
-        /// Path to weights file to resume from
-        #[arg(long)]
+        /// Number of storage and CPU augmentation workers
+        #[arg(long, default_value_t = 4)]
+        workers: usize,
+
+        /// Number of completed host batches allowed in the bounded queue
+        #[arg(long, default_value_t = 2)]
+        queue_batches: usize,
+
+        /// Reproducible epoch and augmentation seed
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+
+        /// Host geometric augmentation for the source-neutral trainer
+        #[arg(long, value_enum, default_value_t = GeometryArg::None)]
+        geometry: GeometryArg,
+
+        /// Checkpoint and metrics output directory
+        #[arg(long, default_value = "weights")]
+        output_dir: String,
+
+        /// Path to weights for a fresh warm-start run
+        #[arg(long, conflicts_with = "resume")]
         weights: Option<String>,
+
+        /// Run directory containing an exact staged checkpoint
+        #[arg(long)]
+        resume: Option<String>,
     },
     /// Evaluate the model
     Test {
@@ -78,18 +121,40 @@ enum Command {
         #[arg(long, default_value_t = 640)]
         input_size: usize,
     },
+    /// Render a training step.csv file as a standalone SVG
+    Plot {
+        /// Training history written by the trainer
+        #[arg(long)]
+        history: String,
+
+        /// SVG output path
+        #[arg(long, default_value = "training-progress.svg")]
+        output: String,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    #[cfg(feature = "cuda")]
+    if let Command::Plot { history, output } = &cli.command {
+        train::progress::write_training_progress_svg(
+            std::path::Path::new(history),
+            std::path::Path::new(output),
+        )?;
+        println!("Wrote {output}");
+        return Ok(());
+    }
+    #[cfg(feature = "libtorch")]
+    let device = Device::libtorch_cuda(DeviceIndex::Default);
+    #[cfg(all(feature = "cuda", not(feature = "libtorch")))]
     let device = Device::cuda(DeviceIndex::Default);
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "libtorch")))]
     let device = Device::wgpu(DeviceKind::DefaultDevice);
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "libtorch")]
+    println!("Using device: LibTorch CUDA");
+    #[cfg(all(feature = "cuda", not(feature = "libtorch")))]
     println!("Using device: CUDA");
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "libtorch")))]
     println!("Using device: Wgpu");
 
     train::util::setup_seed();
@@ -102,23 +167,42 @@ fn main() -> Result<()> {
             input_size,
             batch_size,
             epochs,
+            schedule_epochs,
             eval_interval,
-            weights: _,
+            workers,
+            queue_batches,
+            seed,
+            geometry,
+            output_dir,
+            weights,
+            resume,
         } => {
             let config = train::config::Config::load(&std::path::PathBuf::from(&config))?;
             println!("Loaded config with {} classes", config.num_classes());
 
-            train::profile::profile(&config, input_size)?;
-
-            train::train::train(
-                &config,
-                &data_dir,
+            let options = train::train::TrainingOptions {
                 input_size,
                 batch_size,
                 epochs,
                 eval_interval,
-                &device.clone().autodiff(),
-            )?;
+                loader_workers: workers,
+                queue_batches,
+                seed,
+                geometry: geometry.into(),
+                weights: weights.map(Into::into),
+                reset_class_head: false,
+                gradient_clip: None,
+                trainable_layers: train::train::TrainableLayers::All,
+                batch_norm: train::train::BatchNormPolicy::Update,
+                evaluation_confidence_threshold: 0.001,
+                evaluation_iou_threshold: 0.65,
+                evaluation_max_detections: 300,
+                schedule_epochs,
+                resume: resume.map(Into::into),
+                finalize: false,
+                output_dir: output_dir.into(),
+            };
+            train::train::train(&config, &data_dir, &options, &device.clone().autodiff())?;
         }
         Command::Test {
             config,
@@ -184,6 +268,7 @@ fn main() -> Result<()> {
             println!("Loaded config with {} classes", config.num_classes());
             train::profile::profile(&config, input_size)?;
         }
+        Command::Plot { .. } => unreachable!("plot exits before device setup"),
     }
 
     Ok(())

@@ -157,6 +157,9 @@ impl Head {
     }
 
     pub fn forward(&self, xs: &[Tensor<4>], training: bool) -> HeadOutput {
+        let profile = std::env::var_os("YOLOV11_PROFILE").is_some();
+        let device = xs[0].device();
+        let branches_started = std::time::Instant::now();
         let mut outputs = Vec::with_capacity(self.nl);
         for (i, x) in xs.iter().enumerate() {
             let box_out = self.box_c0[i].forward(x.clone());
@@ -173,6 +176,11 @@ impl Head {
             outputs.push(cat);
         }
 
+        if profile {
+            device.sync().expect("synchronizing YOLO head branches");
+        }
+        let branches_elapsed = branches_started.elapsed();
+
         if training {
             return HeadOutput::Train(outputs);
         }
@@ -181,14 +189,19 @@ impl Head {
         let ch = self.ch;
         let no = nc + ch * 4;
 
-        let device = outputs[0].device();
+        let anchors_started = std::time::Instant::now();
         let (anchors, strides) = make_anchors(&outputs, &self.stride, 0.5, &device);
+        if profile {
+            device.sync().expect("synchronizing YOLO anchors");
+        }
+        let anchors_elapsed = anchors_started.elapsed();
         let anchors = anchors.swap_dims(0, 1); // [2, total]
         let strides = strides.swap_dims(0, 1); // [1, total]
                                                // Add batch dim for broadcasting
         let anchors: Tensor<3> = anchors.unsqueeze_dim(0); // [1, 2, total]
         let strides: Tensor<3> = strides.unsqueeze_dim(0); // [1, 1, total]
 
+        let arrange_started = std::time::Instant::now();
         let b = outputs[0].dims()[0];
         let mut flat: Vec<Tensor<3>> = Vec::new();
         for o in &outputs {
@@ -200,7 +213,12 @@ impl Head {
         let box_ch = 4 * ch;
         let box_raw = x.clone().narrow(1, 0, box_ch);
         let cls_raw = x.narrow(1, box_ch, nc);
+        if profile {
+            device.sync().expect("synchronizing YOLO head arrangement");
+        }
+        let arrange_elapsed = arrange_started.elapsed();
 
+        let decode_started = std::time::Instant::now();
         let dfl_out = self.dfl.forward(box_raw);
         let a_part = dfl_out.clone().narrow(1, 0, 2);
         let b_part = dfl_out.narrow(1, 2, 2);
@@ -213,7 +231,18 @@ impl Head {
         let box_scaled = box_decoded * strides;
 
         let cls_sigmoid = sigmoid(cls_raw);
-        HeadOutput::Infer(Tensor::cat(vec![box_scaled, cls_sigmoid], 1))
+        let output = Tensor::cat(vec![box_scaled, cls_sigmoid], 1);
+        if profile {
+            device.sync().expect("synchronizing YOLO head decode");
+            eprintln!(
+                "YOLOV11_HEAD_PROFILE branches_us={} anchors_us={} arrange_us={} decode_us={}",
+                branches_elapsed.as_micros(),
+                anchors_elapsed.as_micros(),
+                arrange_elapsed.as_micros(),
+                decode_started.elapsed().as_micros(),
+            );
+        }
+        HeadOutput::Infer(output)
     }
 
     pub fn initialize_biases(&mut self) {

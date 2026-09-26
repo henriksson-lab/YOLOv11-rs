@@ -10,8 +10,10 @@ impl CosineLR {
         num_steps_per_epoch: usize,
         total_epochs: usize,
     ) -> Self {
-        let warmup_steps = ((warmup_epochs * num_steps_per_epoch as f64) as usize).max(100);
         let total_steps = num_steps_per_epoch * total_epochs;
+        let warmup_steps = ((warmup_epochs * num_steps_per_epoch as f64) as usize)
+            .max(100)
+            .min(total_steps);
         let decay_steps = total_steps.saturating_sub(warmup_steps);
 
         let mut total_lr = Vec::with_capacity(total_steps);
@@ -67,7 +69,7 @@ mod tests {
         let lr = CosineLR::new(0.0, 1.0, 0.0, 10, 5);
 
         assert_close(lr.step(0), 0.0);
-        assert_close(lr.step(99), 1.0);
+        assert_close(lr.step(49), 1.0);
     }
 
     #[test]
@@ -81,9 +83,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Number of samples")]
-    fn linear_lr_rejects_python_negative_decay_sample_count() {
-        let _ = LinearLR::new(0.0, 1.0, 0.0, 10, 5);
+    fn linear_lr_caps_warmup_for_short_training_runs() {
+        let lr = LinearLR::new(0.0, 1.0, 0.0, 10, 5);
+        assert_close(lr.step(0), 0.0);
+        assert_close(lr.step(49), 49.0 / 50.0);
     }
 }
 
@@ -99,14 +102,11 @@ impl LinearLR {
         num_steps_per_epoch: usize,
         total_epochs: usize,
     ) -> Self {
-        let warmup_steps = ((warmup_epochs * num_steps_per_epoch as f64) as usize).max(100);
         let total_steps = num_steps_per_epoch * total_epochs;
-        let decay_steps = total_steps as isize - warmup_steps as isize;
-        assert!(
-            decay_steps >= 0,
-            "Number of samples, {decay_steps}, must be non-negative"
-        );
-        let decay_steps = decay_steps as usize;
+        let warmup_steps = ((warmup_epochs * num_steps_per_epoch as f64) as usize)
+            .max(100)
+            .min(total_steps);
+        let decay_steps = total_steps.saturating_sub(warmup_steps);
 
         let mut total_lr = Vec::with_capacity(total_steps);
         for step in 0..warmup_steps {

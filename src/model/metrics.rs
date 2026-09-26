@@ -1,4 +1,4 @@
-/// COCO-style mAP evaluation on CPU.
+//! COCO-style mAP evaluation on CPU.
 
 /// Compute TP/FP for predictions against targets at multiple IoU thresholds.
 ///
@@ -78,16 +78,17 @@ pub fn compute_metric(
 ///
 /// Returns `(tp, fp, m_pre, m_rec, map50, mean_ap)` to match the Python
 /// `compute_ap` return order.
-pub fn compute_ap(
+pub fn compute_ap_with_confidence(
     tp: &[Vec<bool>],
     conf: &[f32],
     output: &[f32],
     target: &[f32],
-) -> (Vec<f32>, Vec<f32>, f32, f32, f32, f32) {
+) -> (Vec<f32>, Vec<f32>, f32, f32, f32, f32, f32) {
     if target.is_empty() {
         return (
             Vec::new(),
             Vec::new(),
+            f32::NAN,
             f32::NAN,
             f32::NAN,
             f32::NAN,
@@ -258,7 +259,19 @@ pub fn compute_ap(
         .sum::<f32>()
         / nc as f32;
 
-    (tp, fp, m_pre, m_rec, map50, mean_ap)
+    (tp, fp, m_pre, m_rec, map50, mean_ap, px[best_idx])
+}
+
+/// Compute AP while preserving the historical six-value return contract.
+pub fn compute_ap(
+    tp: &[Vec<bool>],
+    conf: &[f32],
+    output: &[f32],
+    target: &[f32],
+) -> (Vec<f32>, Vec<f32>, f32, f32, f32, f32) {
+    let (tp, fp, precision, recall, map50, mean_ap, _) =
+        compute_ap_with_confidence(tp, conf, output, target);
+    (tp, fp, precision, recall, map50, mean_ap)
 }
 
 #[cfg(test)]

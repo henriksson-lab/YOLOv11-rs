@@ -50,7 +50,7 @@ def rust_struct_name(py_class: str) -> str:
 def python_items() -> list[Item]:
     items: list[Item] = []
     for path in sorted((ROOT / "YOLOv11-pt").rglob("*.py")):
-        if "__pycache__" in path.parts:
+        if "__pycache__" in path.parts or path.name == "benchmark_train_step.py":
             continue
         rel = path.relative_to(ROOT).as_posix()
         tree = ast.parse(path.read_text())
@@ -238,6 +238,28 @@ def main() -> int:
         "Config.cls_gain",
         "Config.dfl_gain",
         "Config.to_augment_params",
+        # Source-neutral, multithreaded Rust training pipeline. The matched
+        # benchmark harness is intentionally outside the translated surface.
+        "BoxTarget",
+        "GeometryPolicy",
+        "RawSample",
+        "PreparedSample",
+        "FileSampleStore",
+        "PlannedSample",
+        "HostBatch",
+        "ParallelBatchLoader",
+        "TrainingOptions",
+        "prepare_sample",
+        "orientation_for",
+        "train_with_stores",
+        "FileSampleStore.new",
+        "FileSampleStore.from_dataset",
+        "HostBatch.len",
+        "HostBatch.is_empty",
+        "HostBatch.upload",
+        "ParallelBatchLoader.new",
+        "ParallelBatchLoader.num_batches",
+        "ParallelBatchLoader.next_batch",
     }
 
     missing = sorted(
