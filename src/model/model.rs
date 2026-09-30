@@ -82,6 +82,22 @@ impl YOLO {
         with_frozen_batch_norm(frozen_batch_norm, || self.forward_inner(x, training))
     }
 
+    /// Return the three feature-pyramid tensors before the 2D detection head.
+    ///
+    /// This is the stable transfer-learning boundary for consumers which reuse
+    /// the microscopy encoder for a different prediction task, such as fusing
+    /// features from adjacent Z slices before a 3D center-detection head.
+    pub fn forward_features_with_batch_norm(
+        &self,
+        x: Tensor<4>,
+        frozen_batch_norm: bool,
+    ) -> (Tensor<4>, Tensor<4>, Tensor<4>) {
+        with_frozen_batch_norm(frozen_batch_norm, || {
+            let (p3, p4, p5) = self.net.forward(x);
+            self.fpn.forward(p3, p4, p5)
+        })
+    }
+
     fn forward_inner(&self, x: Tensor<4>, training: bool) -> YOLOOutput {
         let profile = std::env::var_os("YOLOV11_PROFILE").is_some();
         let device = x.device();
@@ -197,6 +213,11 @@ mod tests {
         let device = burn::tensor::Device::flex().autodiff();
         let model = yolo_v11_n(2, &device);
         let x = Tensor::<4>::zeros([1, 3, 64, 64], &device);
+
+        let (p3, p4, p5) = model.forward_features_with_batch_norm(x.clone(), true);
+        assert_eq!(p3.dims(), [1, 64, 8, 8]);
+        assert_eq!(p4.dims(), [1, 128, 4, 4]);
+        assert_eq!(p5.dims(), [1, 256, 2, 2]);
 
         match model.forward(x, true) {
             YOLOOutput::Train(outputs) => {
