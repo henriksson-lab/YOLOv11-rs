@@ -1,5 +1,7 @@
 # YOLOv11-rs
 
+Build dependency setup and the audited lockfile are described in [DEPENDENCY_SECURITY.md](DEPENDENCY_SECURITY.md).
+
 YOLOv11 object detection implemented in Rust using the [Candle](https://github.com/huggingface/candle) ML framework. Supports both training and inference. Can be used as a library or as a CLI.
 
 Based on the PyTorch re-implementation in [YOLOv11-pt](https://github.com/jahongir7174/YOLOv11-pt).

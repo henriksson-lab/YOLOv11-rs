@@ -2,6 +2,7 @@
 name = "yolov11"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.95"
 
 [features]
 default = []
@@ -9,8 +10,8 @@ cuda = ["burn/cuda"]
 libtorch = ["burn/tch"]
 
 [dependencies]
-burn = { version = "0.22.0-pre.2", features = ["optim", "wgpu", "flex"] }
-burn-store = { version = "0.22.0-pre.2", default-features = false, features = ["std", "safetensors"] }
+burn = { version = "=0.22.0-pre.2", features = ["optim", "wgpu", "flex"] }
+burn-store = { version = "=0.22.0-pre.2", default-features = false, features = ["std", "safetensors"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
@@ -30,3 +31,8 @@ zune-jpeg = "0.5"
 # 0.22.0-pre.2 predates.
 burn = { path = "../burn/crates/burn" }
 burn-store = { path = "../burn/crates/burn-store" }
+
+# Keep the cache SQLite ABI aligned with the patched sibling Burn workspace.
+# Cargo patches must also be repeated by applications consuming this crate.
+[patch."https://github.com/tracel-ai/cubecl"]
+cubecl-environment = { path = "../cubecl-security/crates/cubecl-environment" }

@@ -1,0 +1,75 @@
+{
+  "date": "2026-11-11",
+  "scope": "Local YOLO/Burn/CubeCL dependency security backports; not yet published or selected by Hamilton committed git pins",
+  "source_repositories": {
+    "yolo": "/home/mahogny/github/claude/YOLOv11-rs",
+    "burn": {
+      "base": "e20ada6837eaadf59e2e78efd572788c178c9bd5",
+      "fixed_commit": "fa0db7e40a1ad7542e41da60ec174e9af99f7375",
+      "path": "/home/mahogny/github/claude/burn"
+    },
+    "cubecl": {
+      "base": "48348968468e433235be3db6e7c344c34bc446c0",
+      "fixed_commit": "17baf69c8c96d351203e22013c5de6e744b3949c",
+      "branch": "security/sqlite-041",
+      "path": "/home/mahogny/github/claude/cubecl-security",
+      "original_newer_checkout_preserved": true
+    },
+    "yolo_base": "a9bc208a234a30422efcde47efc5dece4af735e9"
+  },
+  "resolved_versions": {
+    "libsqlite3-sys": "0.39.1",
+    "pliron": "0.17.0",
+    "pliron-derive": "0.17.0",
+    "r2d2_sqlite": "0.36.0",
+    "rusqlite": "0.41.1",
+    "serde_rusqlite": "0.44.0",
+    "tch": "0.27.0",
+    "torch-sys": "0.27.0",
+    "zip": "9.5.1",
+    "zstd": "0.14.3",
+    "zstd-safe": "8.2.0"
+  },
+  "audit": {
+    "yolo_local_vulnerabilities": 0,
+    "hamilton_local_override_vulnerabilities": 0,
+    "hamilton_published_pins_vulnerabilities": 6,
+    "warnings": {
+      "unmaintained": 4
+    },
+    "database": {
+      "advisory-count": 1458,
+      "last-commit": null,
+      "last-updated": null
+    }
+  },
+  "native_libtorch_required": "2.15.0",
+  "native_libtorch_runtime_tested": false,
+  "cuda_tested": false,
+  "verification": {
+    "yolo_all_targets_check": "passed",
+    "libtorch_api_check": "passed using upstream doc-only feature; no native link or runtime",
+    "existing_cpu_model_tests": {
+      "passed": 4,
+      "failed": 0,
+      "filter": "model::model::tests",
+      "covers": [
+        "training forward and feature pyramid",
+        "fusion",
+        "backbone freezing",
+        "backbone and neck freezing"
+      ]
+    },
+    "hamilton_local_detector_and_training_check": "passed, both binaries using isolated manifest and local patches",
+    "hamilton_original_manifest_exact_prerelease_metadata": "passed --locked --offline"
+  },
+  "reproduction": "YOLO DEPENDENCY_SECURITY.md and patches/*.patch",
+  "publication_required": true,
+  "publication_plan": [
+    "Publish CubeCL security/sqlite-041 and Burn commits to their mahogny forks; publish YOLO changes to henriksson-lab/YOLOv11-rs.",
+    "Change Hamilton YOLO and Burn git revision pins.",
+    "Add a root patch for cubecl-environment from https://github.com/mahogny/cubecl.git at the fixed commit; target source https://github.com/tracel-ai/cubecl.",
+    "Regenerate Hamilton tool lockfile, retaining pliron and pliron-derive 0.17, then compile and audit it."
+  ],
+  "committing": "YOLO security changes included in the containing checkpoint; Burn and CubeCL have separate commits. No changes have been pushed."
+}
